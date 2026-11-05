@@ -39,7 +39,8 @@
         {
           "locationWhenInUsePermission": "주소 변환과 현재 위치 확인에 사용합니다."
         }
-      ]
+      ],
+      "expo-font"
     ],
     "extra": {
       "eas": {
