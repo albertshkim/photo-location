@@ -1,10 +1,9 @@
 import 'react-native-gesture-handler';
-import React, { createContext, useContext, useState } from 'react';
+import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
 import {
   View,
   Text,
   TextInput,
-  Image,
   FlatList,
   TouchableOpacity,
   ActivityIndicator,
@@ -20,7 +19,7 @@ import {
 import { NavigationContainer } from '@react-navigation/native';
 import { createStackNavigator } from '@react-navigation/stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
-import { Ionicons } from '@expo/vector-icons'; // Snack에서는 react-native-vector-icons 대신 사용
+import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import * as Location from 'expo-location';
 // 갤러리 DB에서 사진 위치를 직접 읽기 위해 사용 (웹 미지원)
@@ -30,9 +29,23 @@ import { Image as ExpoImage } from 'expo-image';
 import Constants from 'expo-constants';
 
 const IS_WEB = Platform.OS === 'web';
-// Expo Go(Android)는 미디어 라이브러리 권한 요청이 거부됨 → 갤러리 DB 방식 사용 불가
+// Expo Go(Android)는 미디어 라이브러리 전체 접근이 거부됨 → 갤러리 DB 방식 사용 불가
 const IS_EXPO_GO = Constants.executionEnvironment === 'storeClient';
 const CAN_USE_MEDIA_LIBRARY = !IS_WEB && !(IS_EXPO_GO && Platform.OS === 'android');
+
+// 디버그 박스 표시 여부 (원인 확인이 끝나면 false로)
+const SHOW_DEBUG = true;
+
+/* ─────────────────────────────
+ * 주소 변환 설정
+ * ─────────────────────────────
+ * 카카오 로컬 API(국내 주소가 가장 정확하고 빠름)를 쓰려면
+ * https://developers.kakao.com 에서 앱 생성 → "REST API 키"를 넣으세요.
+ * 비워두면 [기기 지오코더 → OpenStreetMap] 순서로만 시도합니다.
+ */
+const KAKAO_REST_API_KEY = '';
+// OpenStreetMap(Nominatim) 이용 정책상 앱을 식별할 수 있는 User-Agent가 필요합니다.
+const NOMINATIM_USER_AGENT = 'PhotoLocationApp/1.0 (contact: your-email@example.com)';
 
 /* ─────────────────────────────
  * 공유 상태 (사진 목록)
@@ -90,6 +103,7 @@ function getCoordsFromExif(exif) {
     ? toDecimal(gps.Longitude, gps.LongitudeRef)
     : toDecimal(exif.GPSLongitude, exif.GPSLongitudeRef);
   if (lat == null || lng == null || (lat === 0 && lng === 0)) return null;
+  if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
   return { latitude: lat, longitude: lng };
 }
 
@@ -112,6 +126,133 @@ function gpsDebugText(exif) {
   return Object.keys(out).length ? JSON.stringify(out, null, 1) : 'exif에 GPS 항목 없음';
 }
 
+/* ─────────────────────────────
+ * 비동기 유틸 (타임아웃)
+ * ───────────────────────────── */
+// 일정 시간 안에 끝나지 않으면 실패 처리 (기기 지오코더가 멈춰 있는 경우 대비)
+function withTimeout(promise, ms, label = '작업') {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} 시간 초과(${ms / 1000}초)`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// fetch + 타임아웃 + JSON 파싱
+async function fetchJson(url, options = {}, ms = 5000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const res = await fetch(url, { ...options, signal: ctrl.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } catch (e) {
+    if (e?.name === 'AbortError') throw new Error(`응답 시간 초과(${ms / 1000}초)`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* ─────────────────────────────
+ * 좌표 → 주소 변환
+ * ───────────────────────────── */
+// ★ 핵심: Android의 reverseGeocodeAsync는 위치 권한이 없으면 무조건 실패합니다.
+//   APK는 Expo Go와 별개의 앱이라 권한이 처음엔 없으므로, 변환 직전에 확보합니다.
+async function ensureLocationPermission() {
+  let perm = await Location.getForegroundPermissionsAsync();
+  if (!perm.granted && perm.canAskAgain) {
+    perm = await Location.requestForegroundPermissionsAsync();
+  }
+  return perm.granted;
+}
+
+/* 방법 1: 카카오 로컬 API (국내 좌표 전용, 키 필요) */
+async function geocodeKakao(c) {
+  const url =
+    'https://dapi.kakao.com/v2/local/geo/coord2address.json' +
+    `?x=${c.longitude}&y=${c.latitude}`;
+  const json = await fetchJson(
+    url,
+    { headers: { Authorization: `KakaoAK ${KAKAO_REST_API_KEY}` } },
+    4000
+  );
+  const d = json?.documents?.[0];
+  const addr = d?.road_address?.address_name || d?.address?.address_name;
+  if (!addr) throw new Error('결과 없음(국외 좌표일 수 있음)');
+  const building = d?.road_address?.building_name;
+  return building ? `${addr} (${building})` : addr;
+}
+
+/* 방법 2: 기기 내장 지오코더 (Android는 Google Play 서비스 + 위치 권한 필요) */
+async function geocodeNative(c) {
+  if (!(await ensureLocationPermission())) throw new Error('위치 권한 없음');
+  const results = await withTimeout(Location.reverseGeocodeAsync(c), 4000, '기기 지오코더');
+  const a = results?.[0];
+  if (!a) throw new Error('결과 없음');
+  if (a.formattedAddress) return a.formattedAddress;
+  const parts = [a.region, a.city, a.district, a.street, a.streetNumber, a.name].filter(Boolean);
+  const unique = [...new Set(parts)];
+  if (!unique.length) throw new Error('빈 주소');
+  return unique.join(' ');
+}
+
+/* 방법 3: OpenStreetMap Nominatim (키 불필요, 초당 1회 제한) */
+async function geocodeNominatim(c) {
+  const url =
+    'https://nominatim.openstreetmap.org/reverse?format=jsonv2&addressdetails=1&zoom=18' +
+    `&accept-language=ko&lat=${c.latitude}&lon=${c.longitude}`;
+  // 브라우저는 User-Agent 변경을 막으므로 네이티브에서만 지정
+  const headers = IS_WEB ? {} : { 'User-Agent': NOMINATIM_USER_AGENT };
+  const json = await fetchJson(url, { headers }, 6000);
+  if (json?.error) throw new Error(json.error);
+  const a = json?.address || {};
+  const parts = [
+    a.province || a.state,
+    a.city || a.county,
+    a.borough || a.city_district,
+    a.suburb || a.quarter || a.town || a.village,
+    a.road,
+    a.house_number,
+  ].filter(Boolean);
+  const unique = [...new Set(parts)];
+  if (unique.length >= 2) return unique.join(' ');
+  if (json?.display_name) return json.display_name;
+  throw new Error('결과 없음');
+}
+
+// 같은 장소(약 10m 이내)는 다시 조회하지 않도록 캐시
+const addressCache = new Map();
+const cacheKey = (c) => `${c.latitude.toFixed(4)},${c.longitude.toFixed(4)}`;
+
+// 좌표 → { address, source, errors }
+// 여러 방법을 순서대로 시도하고, 하나라도 성공하면 즉시 반환
+async function resolveAddress(c) {
+  const key = cacheKey(c);
+  if (addressCache.has(key)) return { address: addressCache.get(key), source: '캐시', errors: [] };
+
+  const providers = [
+    KAKAO_REST_API_KEY && ['카카오', geocodeKakao],
+    !IS_WEB && ['기기', geocodeNative],
+    ['OpenStreetMap', geocodeNominatim],
+  ].filter(Boolean);
+
+  const errors = [];
+  for (const [name, fn] of providers) {
+    try {
+      const address = await fn(c);
+      addressCache.set(key, address);
+      return { address, source: name, errors };
+    } catch (e) {
+      errors.push(`${name}: ${e?.message ?? e}`);
+    }
+  }
+  return { address: null, source: null, errors };
+}
+
+/* ─────────────────────────────
+ * 갤러리 DB 유틸
+ * ───────────────────────────── */
 async function ensureLibraryPermission() {
   const res = await MediaLibrary.requestPermissionsAsync(false, ['photo']);
   return res.granted;
@@ -119,9 +260,13 @@ async function ensureLibraryPermission() {
 
 // 갤러리 asset에서 위치 + 표시용 uri 가져오기
 async function readAssetInfo(assetOrId) {
-  const info = await MediaLibrary.getAssetInfoAsync(assetOrId, {
-    shouldDownloadFromNetwork: true, // iCloud 원본만 있는 사진도 localUri 확보
-  });
+  const info = await withTimeout(
+    MediaLibrary.getAssetInfoAsync(assetOrId, {
+      shouldDownloadFromNetwork: true, // iCloud 원본만 있는 사진도 localUri 확보
+    }),
+    8000,
+    '갤러리 조회'
+  );
   return {
     uri: info.localUri || info.uri,
     coords: validCoords(info.location) || getCoordsFromExif(info.exif),
@@ -139,9 +284,11 @@ function GalleryModal({ visible, onClose, onSelect }) {
   const [hasMore, setHasMore] = useState(true);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState(null); // { granted, access, total, error }
+  const busyRef = useRef(false); // 중복 로드 방지 (state는 비동기라 ref 사용)
 
   const load = async (reset = false) => {
-    if (busy || (!reset && !hasMore)) return;
+    if (busyRef.current || (!reset && !hasMore)) return;
+    busyRef.current = true;
     setBusy(true);
     try {
       const page = await MediaLibrary.getAssetsAsync({
@@ -157,6 +304,7 @@ function GalleryModal({ visible, onClose, onSelect }) {
     } catch (e) {
       setStatus((s) => ({ ...s, error: e.message }));
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };
@@ -174,8 +322,9 @@ function GalleryModal({ visible, onClose, onSelect }) {
     }
   };
 
-  React.useEffect(() => {
+  useEffect(() => {
     if (visible) init();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible]);
 
   // iOS / Android 14+ "일부 사진만 허용" 상태에서 허용 사진 추가
@@ -183,7 +332,7 @@ function GalleryModal({ visible, onClose, onSelect }) {
     try {
       await MediaLibrary.presentPermissionsPickerAsync(['photo']);
       await init();
-    } catch (e) {
+    } catch {
       Alert.alert('알림', '설정에서 사진 접근을 "모든 사진"으로 바꿔주세요.');
     }
   };
@@ -237,7 +386,7 @@ function GalleryModal({ visible, onClose, onSelect }) {
           <View style={{ width: 32 }} />
         )}
       </View>
-      {status && (
+      {status && SHOW_DEBUG && (
         <Text style={styles.statusLine}>
           {Platform.OS} · 권한 {status.granted ? '허용' : '거부'} · 범위 {status.access} · 사진{' '}
           {status.total ?? '-'}장 · 표시 {assets.length}장
@@ -274,7 +423,7 @@ function PhotoListScreen({ navigation }) {
   const { items, deleteItem } = usePhotos();
 
   const confirmDelete = (id) => {
-    if (Platform.OS === 'web') {
+    if (IS_WEB) {
       // Snack 웹 미리보기에서는 Alert 버튼이 동작하지 않음
       if (window.confirm('이 항목을 삭제할까요?')) deleteItem(id);
       return;
@@ -332,55 +481,94 @@ function PhotoInputScreen({ navigation }) {
   const [location, setLocation] = useState('');
   const [coords, setCoords] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [note, setNote] = useState('');
+  const [note, setNote] = useState(null); // { text, warn }
   const [debug, setDebug] = useState('');
   const [galleryOpen, setGalleryOpen] = useState(false);
+  // 요청 번호: 주소 조회 중 다른 사진을 고르면 이전 결과가 덮어쓰지 않도록 함
+  const reqId = useRef(0);
+
+  const addDebug = (line) => setDebug((d) => (d ? `${d}\n${line}` : line));
 
   const reset = () => {
+    reqId.current += 1; // 진행 중인 조회 무효화
     setUri(null);
     setTitle('');
     setLocation('');
     setCoords(null);
-    setNote('');
+    setLoading(false);
+    setNote(null);
     setDebug('');
   };
 
-  const applyCoords = async (c, source) => {
-    if (c) {
-      setCoords(c);
-      setLocation(await resolveAddress(c));
-      setNote(`위치 출처: ${source}`);
+  const clearLocation = () => {
+    setCoords(null);
+    setLocation('');
+  };
+
+  // 위치 없음 안내 문구 (환경별)
+  const noLocationNote = () =>
+    Platform.OS === 'android'
+      ? IS_EXPO_GO
+        ? 'Expo Go(Android)에서는 갤러리 사진의 위치를 읽을 수 없는 경우가 많아요. "촬영하고 위치 저장" 또는 "현재 위치 사용"을 쓰거나, development build로 테스트하세요.'
+        : '사진에 위치가 없거나 선택기가 위치를 지웠어요. "갤러리에서 직접 선택"을 눌러보세요.'
+      : '사진에 위치 정보가 없어요. 직접 입력하거나 현재 위치를 사용하세요.';
+
+  // 좌표를 먼저 화면에 보여주고, 주소는 비동기로 채움
+  // id: 이 요청을 시작한 요청 번호 (이미 더 새로운 요청이 있으면 결과를 버림)
+  const applyCoords = async (c, source, id = ++reqId.current) => {
+    if (id !== reqId.current) return;
+    if (!c) {
+      clearLocation();
+      setLoading(false);
+      setNote({ text: noLocationNote(), warn: true });
+      return;
+    }
+
+    setCoords(c);
+    setLocation('');
+    setLoading(true);
+    setNote({ text: '주소를 찾는 중…', warn: false });
+
+    const r = await resolveAddress(c);
+    if (id !== reqId.current) return; // 그 사이 다른 요청이 시작됨
+
+    setLoading(false);
+    if (r.errors.length) addDebug(`[주소 변환 실패 기록]\n${r.errors.join('\n')}`);
+    if (r.address) {
+      setLocation(r.address);
+      setNote({ text: `위치 출처: ${source} · 주소: ${r.source}`, warn: false });
     } else {
-      setCoords(null);
-      setLocation('');
-      setNote(
-        Platform.OS === 'android'
-          ? IS_EXPO_GO
-            ? 'Expo Go(Android)에서는 갤러리 사진의 위치를 읽을 수 없는 경우가 많아요. "촬영하고 위치 저장" 또는 "현재 위치 사용"을 쓰거나, development build로 테스트하세요.'
-            : 'Android 사진 선택기가 위치를 지웠을 수 있어요. "갤러리에서 직접 선택"을 눌러보세요.'
-          : '사진에 위치 정보가 없어요. 직접 입력하거나 현재 위치를 사용하세요.'
-      );
+      setLocation(coordText(c));
+      setNote({
+        text: `주소 변환에 실패해 좌표로 입력했어요. 네트워크를 확인하거나 "주소 다시 찾기"를 눌러주세요.\n${r.errors.join('\n')}`,
+        warn: true,
+      });
     }
   };
 
   // 갤러리 모달에서 고른 사진: 갤러리 DB의 위치 정보 사용
   const onGallerySelect = async (asset) => {
     setGalleryOpen(false);
+    const id = ++reqId.current;
     setUri(asset.uri);
+    clearLocation();
     setLoading(true);
+    setNote({ text: '사진의 위치 정보를 읽는 중…', warn: false });
+    setDebug('');
+    let c = null;
     try {
       const info = await readAssetInfo(asset);
+      if (id !== reqId.current) return;
       if (info.uri) setUri(info.uri);
-      setDebug(`갤러리 DB location: ${info.coords ? coordText(info.coords) : '없음'}`);
-      await applyCoords(info.coords, '갤러리 DB');
+      c = info.coords;
+      addDebug(`[갤러리 DB location] ${c ? coordText(c) : '없음'}`);
     } catch (e) {
-      setDebug(`getAssetInfoAsync 오류: ${e.message}`);
-      await applyCoords(null);
-    } finally {
-      setLoading(false);
+      addDebug(`[getAssetInfoAsync 오류] ${e.message}`);
     }
+    await applyCoords(c, '갤러리 DB', id);
   };
 
+  // 시스템 사진 선택기로 고르기
   const pickImage = async () => {
     const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!perm.granted) {
@@ -397,32 +585,74 @@ function PhotoInputScreen({ navigation }) {
     if (result.canceled) return;
 
     const asset = result.assets[0];
+    const id = ++reqId.current;
     setUri(asset.uri);
+    clearLocation();
     setLoading(true);
-    setNote('');
+    setNote({ text: '사진의 위치 정보를 읽는 중…', warn: false });
     setDebug(`[EXIF] ${gpsDebugText(asset.exif)}\n[assetId] ${asset.assetId ?? '없음'}`);
+
+    // 1순위: 선택기가 넘겨준 EXIF
+    let c = getCoordsFromExif(asset.exif);
+    let source = 'EXIF';
+    // 2순위: assetId가 있으면 갤러리 DB에서 위치 조회
+    if (!c && asset.assetId && CAN_USE_MEDIA_LIBRARY) {
+      try {
+        if (await ensureLibraryPermission()) {
+          c = (await readAssetInfo(asset.assetId)).coords;
+          source = '갤러리 DB';
+        }
+      } catch (e) {
+        addDebug(`[getAssetInfoAsync 오류] ${e.message}`);
+      }
+    }
+    await applyCoords(c, source, id);
+  };
+
+  // 현재 위치를 좌표 + 주소로 채움 (촬영 직후, 또는 "현재 위치 사용" 버튼)
+  // ※ 이름이 use로 시작하면 React Hook으로 오인되므로 fill...로 변경
+  const fillCurrentLocation = async (source = '현재 위치') => {
+    const id = ++reqId.current;
+    setLoading(true);
+    setNote({ text: '현재 위치를 확인하는 중…', warn: false });
     try {
-      // 1순위: 선택기가 넘겨준 EXIF
-      let c = getCoordsFromExif(asset.exif);
-      let source = 'EXIF';
-      // 2순위: assetId가 있으면 갤러리 DB에서 위치 조회
-      if (!c && asset.assetId && CAN_USE_MEDIA_LIBRARY) {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (id !== reqId.current) return;
+      if (status !== 'granted') {
+        clearLocation();
+        setLoading(false);
+        setNote({ text: '위치 권한이 없어 위치를 저장하지 못했어요. 설정에서 위치 권한을 허용해주세요.', warn: true });
+        return;
+      }
+
+      // 빠른 응답: 1분 이내의 마지막 위치가 있으면 그대로 사용
+      let pos = null;
+      if (!IS_WEB) {
         try {
-          if (await ensureLibraryPermission()) {
-            c = (await readAssetInfo(asset.assetId)).coords;
-            source = '갤러리 DB';
-          }
-        } catch (e) {
-          setDebug((d) => `${d}\n[getAssetInfoAsync 오류] ${e.message}`);
+          pos = await Location.getLastKnownPositionAsync({ maxAge: 60_000, requiredAccuracy: 100 });
+        } catch {
+          pos = null;
         }
       }
-      await applyCoords(c, source);
-    } finally {
+      if (!pos) {
+        pos = await withTimeout(
+          Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
+          10000,
+          '현재 위치'
+        );
+      }
+      if (id !== reqId.current) return;
+      await applyCoords({ latitude: pos.coords.latitude, longitude: pos.coords.longitude }, source, id);
+    } catch (e) {
+      if (id !== reqId.current) return;
+      clearLocation();
       setLoading(false);
+      addDebug(`[현재 위치 오류] ${e?.message ?? e}`);
+      setNote({ text: '현재 위치를 가져오지 못했어요. GPS가 켜져 있는지 확인해주세요.', warn: true });
     }
   };
 
-  // Expo Go에서도 확실히 동작: 촬영 직후 현재 위치를 저장
+  // 촬영 직후 현재 위치를 저장 (Expo Go에서도 동작)
   const takePhoto = async () => {
     const cam = await ImagePicker.requestCameraPermissionsAsync();
     if (!cam.granted) {
@@ -433,27 +663,7 @@ function PhotoInputScreen({ navigation }) {
     if (result.canceled) return;
     setUri(result.assets[0].uri);
     setDebug('[카메라 촬영] 현재 위치 사용');
-    await useCurrentLocation();
-  };
-
-  const useCurrentLocation = async () => {
-    setLoading(true);
-    try {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert('권한 필요', '위치 권한이 필요해요.');
-        return;
-      }
-      const pos = await Location.getCurrentPositionAsync({});
-      const c = { latitude: pos.coords.latitude, longitude: pos.coords.longitude };
-      setCoords(c);
-      setLocation(await resolveAddress(c));
-      setNote('');
-    } catch {
-      Alert.alert('오류', '현재 위치를 가져오지 못했어요.');
-    } finally {
-      setLoading(false);
-    }
+    await fillCurrentLocation('촬영 위치(현재 위치)');
   };
 
   const save = () => {
@@ -501,9 +711,11 @@ function PhotoInputScreen({ navigation }) {
           {loading && <ActivityIndicator style={{ marginLeft: 8 }} />}
         </View>
         {coords && <Text style={styles.coords}>{coordText(coords)}</Text>}
-        {!!note && <Text style={styles.note}>{note}</Text>}
+        {note && (
+          <Text style={[styles.note, note.warn && styles.noteWarn]}>{note.text}</Text>
+        )}
 
-        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+        <View style={styles.btnRow}>
           {!IS_WEB && (
             <TouchableOpacity style={styles.secondaryBtn} onPress={takePhoto}>
               <Ionicons name="camera-outline" size={16} color="#2563eb" />
@@ -516,15 +728,23 @@ function PhotoInputScreen({ navigation }) {
               <Text style={styles.secondaryText}>갤러리에서 직접 선택</Text>
             </TouchableOpacity>
           )}
-          <TouchableOpacity style={styles.secondaryBtn} onPress={useCurrentLocation}>
+          <TouchableOpacity style={styles.secondaryBtn} onPress={() => fillCurrentLocation()}>
             <Ionicons name="locate-outline" size={16} color="#2563eb" />
             <Text style={styles.secondaryText}>현재 위치 사용</Text>
           </TouchableOpacity>
+          {coords && !loading && (
+            <TouchableOpacity
+              style={styles.secondaryBtn}
+              onPress={() => applyCoords(coords, '이전 좌표')}>
+              <Ionicons name="refresh-outline" size={16} color="#2563eb" />
+              <Text style={styles.secondaryText}>주소 다시 찾기</Text>
+            </TouchableOpacity>
+          )}
         </View>
 
-        {!!debug && (
+        {SHOW_DEBUG && !!debug && (
           <View style={styles.debugBox}>
-            <Text style={styles.debugTitle}>디버그 (원인 확인 후 삭제하세요)</Text>
+            <Text style={styles.debugTitle}>디버그 (원인 확인 후 SHOW_DEBUG = false)</Text>
             <Text style={styles.debugText}>{debug}</Text>
           </View>
         )}
@@ -544,7 +764,7 @@ function PhotoInputScreen({ navigation }) {
 }
 
 /* ─────────────────────────────
- * 네비게이션 (샘플 구조 참고)
+ * 네비게이션
  * ───────────────────────────── */
 const Stack = createStackNavigator();
 const Tab = createBottomTabNavigator();
@@ -590,7 +810,6 @@ export default function App() {
         <Tab.Navigator
           screenOptions={({ route }) => ({
             headerShown: false,
-            // v6 이상에서는 tabBarOptions 대신 screenOptions에 지정
             tabBarActiveTintColor: 'tomato',
             tabBarInactiveTintColor: 'gray',
             tabBarIcon: ({ color, size }) => {
@@ -651,10 +870,11 @@ const styles = StyleSheet.create({
     fontSize: 15,
   },
   locRow: { flexDirection: 'row', alignItems: 'center' },
-  note: { marginTop: 6, fontSize: 13, color: '#d97706' },
+  note: { marginTop: 6, fontSize: 13, color: '#4b5563' },
+  noteWarn: { color: '#d97706' },
+  btnRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 4 },
   secondaryBtn: {
-    marginTop: 12,
-    alignSelf: 'flex-start',
+    marginTop: 8,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 4,
