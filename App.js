@@ -1,40 +1,47 @@
 import 'react-native-gesture-handler';
-import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
   View,
   Text,
-  TextInput,
   FlatList,
   TouchableOpacity,
   ActivityIndicator,
   Alert,
-  ScrollView,
-  KeyboardAvoidingView,
   Platform,
   StyleSheet,
   Modal,
   Dimensions,
   Linking,
 } from 'react-native';
-import { NavigationContainer } from '@react-navigation/native';
-import { createStackNavigator } from '@react-navigation/stack';
-import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { Ionicons } from '@expo/vector-icons';
-import * as ImagePicker from 'expo-image-picker';
 import * as Location from 'expo-location';
 // 갤러리 DB에서 사진 위치를 직접 읽기 위해 사용 (웹 미지원)
 // ※ SDK 58 이상에서 getAssetsAsync 관련 오류가 나면 'expo-media-library/legacy'로 바꾸세요
 import * as MediaLibrary from 'expo-media-library';
 import { Image as ExpoImage } from 'expo-image';
 import Constants from 'expo-constants';
+// 저장/불러오기 모듈 (프로젝트·사진 목록, 사진 파일)
+import {
+  PREFIX_RE,
+  PREFIX_RULE,
+  loadProjects,
+  saveProjects,
+  loadLastProjectId,
+  saveLastProjectId,
+  loadItems,
+  saveItems,
+  persistPhoto,
+  removePhoto,
+  deleteProjectData,
+} from './storage';
 
-const IS_WEB = Platform.OS === 'web';
+export const IS_WEB = Platform.OS === 'web';
 // Expo Go(Android)는 미디어 라이브러리 전체 접근이 거부됨 → 갤러리 DB 방식 사용 불가
-const IS_EXPO_GO = Constants.executionEnvironment === 'storeClient';
-const CAN_USE_MEDIA_LIBRARY = !IS_WEB && !(IS_EXPO_GO && Platform.OS === 'android');
+export const IS_EXPO_GO = Constants.executionEnvironment === 'storeClient';
+export const CAN_USE_MEDIA_LIBRARY = !IS_WEB && !(IS_EXPO_GO && Platform.OS === 'android');
 
 // 디버그 박스 표시 여부 (원인 확인이 끝나면 false로)
-const SHOW_DEBUG = true;
+export const SHOW_DEBUG = true;
 
 /* ─────────────────────────────
  * 주소 변환 설정
@@ -48,19 +55,212 @@ const KAKAO_REST_API_KEY = '';
 const NOMINATIM_USER_AGENT = 'PhotoLocationApp/1.0 (contact: your-email@example.com)';
 
 /* ─────────────────────────────
- * 공유 상태 (사진 목록)
- * ───────────────────────────── */
+ * 공유 상태 (프로젝트 + 사진 목록) — 모든 변경은 자동 저장됨
+ * ─────────────────────────────
+ * usePhotos()가 주는 값
+ *   items, addItem, updateItem, deleteItem       ← 현재 프로젝트의 사진
+ *   projects (최근 사용 순), currentProject
+ *   openProject(id), createProject({ name, type, prefix }), deleteProject(id)
+ *   isPrefixAvailable(prefix)
+ */
 const PhotoContext = createContext(null);
-const usePhotos = () => useContext(PhotoContext);
+export const usePhotos = () => useContext(PhotoContext);
 
-function PhotoProvider({ children }) {
-  const [items, setItems] = useState([]);
-  const addItem = (item) =>
-    setItems((prev) => [{ ...item, id: Date.now().toString() }, ...prev]);
-  const deleteItem = (id) =>
-    setItems((prev) => prev.filter((it) => it.id !== id));
+// 처음 실행할 때 자동으로 만드는 기본 프로젝트
+const DEFAULT_PROJECT = { name: '내 사진', type: 'topic', prefix: 'default' };
+
+const newProject = ({ name, type, prefix }) => {
+  const now = Date.now();
+  return { id: `p_${now}_${Math.random().toString(36).slice(2, 6)}`, name, type, prefix, count: 0, createdAt: now, lastUsedAt: now };
+};
+
+export function PhotoProvider({ children }) {
+  const [ready, setReady] = useState(false);
+  const [loadError, setLoadError] = useState(null);
+  const [projects, setProjectsState] = useState([]);
+  const [currentId, setCurrentId] = useState(null);
+  const [items, setItemsState] = useState([]);
+  // 비동기 작업 중에도 항상 최신 값을 읽기 위한 ref
+  const projectsRef = useRef([]);
+  const itemsRef = useRef([]);
+  const currentRef = useRef(null); // { id, prefix }
+
+  const warn = (e) => console.warn('[PhotoProvider] 저장 실패', e);
+
+  // 프로젝트 목록 변경 + 저장
+  const commitProjects = (next) => {
+    projectsRef.current = next;
+    setProjectsState(next);
+    saveProjects(next).catch(warn);
+  };
+  const touchProject = (id, patch = {}) =>
+    commitProjects(
+      projectsRef.current.map((p) => (p.id === id ? { ...p, ...patch, lastUsedAt: Date.now() } : p))
+    );
+
+  // 현재 프로젝트의 사진 목록 변경 + 저장
+  const commitItems = (next) => {
+    const cur = currentRef.current;
+    if (!cur) return;
+    itemsRef.current = next;
+    setItemsState(next);
+    saveItems(cur.prefix, next).catch(warn);
+    touchProject(cur.id, { count: next.length });
+  };
+
+  /* ── 프로젝트 ── */
+  const isPrefixAvailable = (prefix) =>
+    !projectsRef.current.some((p) => p.prefix.toLowerCase() === String(prefix).toLowerCase());
+
+  const openProject = async (id) => {
+    const p = projectsRef.current.find((x) => x.id === id);
+    if (!p) throw new Error('프로젝트를 찾을 수 없어요.');
+    const list = await loadItems(p.prefix);
+    currentRef.current = { id: p.id, prefix: p.prefix };
+    itemsRef.current = list;
+    setItemsState(list);
+    setCurrentId(p.id);
+    saveLastProjectId(p.id).catch(warn);
+    touchProject(p.id, { count: list.length });
+  };
+
+  const createProject = async ({ name, type, prefix }) => {
+    if (!name?.trim()) throw new Error('프로젝트 이름을 입력해주세요.');
+    if (!PREFIX_RE.test(prefix)) throw new Error(`접두어 규칙: ${PREFIX_RULE}`);
+    if (!isPrefixAvailable(prefix)) throw new Error('이미 사용 중인 접두어예요.');
+    // 같은 접두어로 남아 있던 예전 데이터가 있으면 정리
+    await deleteProjectData(prefix);
+    const p = newProject({ name: name.trim(), type, prefix });
+    commitProjects([p, ...projectsRef.current]);
+    await openProject(p.id);
+    return p;
+  };
+
+  const deleteProject = async (id) => {
+    const p = projectsRef.current.find((x) => x.id === id);
+    if (!p) return;
+    await deleteProjectData(p.prefix);
+    const rest = projectsRef.current.filter((x) => x.id !== id);
+    commitProjects(rest);
+    if (currentRef.current?.id === id) {
+      currentRef.current = null;
+      if (rest.length) {
+        const recent = [...rest].sort((a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0))[0];
+        await openProject(recent.id);
+      } else {
+        await createProject(DEFAULT_PROJECT); // 프로젝트가 하나도 없으면 기본 프로젝트 생성
+      }
+    }
+  };
+
+  /* ── 사진 (현재 프로젝트) ── */
+  const addItem = async (item) => {
+    const cur = currentRef.current;
+    if (!cur) throw new Error('열려 있는 프로젝트가 없어요.');
+    const uri = await persistPhoto(item.uri, cur.prefix);
+    const now = Date.now();
+    const newItem = {
+      ...item,
+      uri,
+      id: `${now}${Math.floor(Math.random() * 1000)}`,
+      createdAt: item.createdAt ?? now,
+    };
+    commitItems([newItem, ...itemsRef.current]);
+    return newItem;
+  };
+
+  // 수정: id·순서·createdAt 유지, 사진이 바뀌면 새 파일 복사 후 예전 파일 삭제
+  const updateItem = async (id, patch) => {
+    const cur = currentRef.current;
+    const old = itemsRef.current.find((it) => it.id === id);
+    if (!cur || !old) throw new Error('수정할 항목을 찾을 수 없어요.');
+    let uri = old.uri;
+    if (patch.uri && patch.uri !== old.uri) {
+      uri = await persistPhoto(patch.uri, cur.prefix);
+      if (uri !== old.uri) removePhoto(old.uri);
+    }
+    commitItems(
+      itemsRef.current.map((it) =>
+        it.id === id
+          ? { ...it, ...patch, uri, id: it.id, createdAt: it.createdAt, updatedAt: Date.now() }
+          : it
+      )
+    );
+  };
+
+  const deleteItem = async (id) => {
+    const old = itemsRef.current.find((it) => it.id === id);
+    commitItems(itemsRef.current.filter((it) => it.id !== id));
+    if (old) await removePhoto(old.uri);
+  };
+
+  /* ── 앱 시작: 저장된 프로젝트 불러오기 → 마지막 프로젝트 열기 ── */
+  const init = async () => {
+    setLoadError(null);
+    try {
+      const list = await loadProjects();
+      projectsRef.current = list;
+      setProjectsState(list);
+      if (!list.length) {
+        await createProject(DEFAULT_PROJECT);
+      } else {
+        const lastId = await loadLastProjectId();
+        const target =
+          list.find((p) => p.id === lastId) ??
+          [...list].sort((a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0))[0];
+        await openProject(target.id);
+      }
+      setReady(true);
+    } catch (e) {
+      setLoadError(e?.message ?? String(e));
+    }
+  };
+  useEffect(() => {
+    init();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 최근 사용 순으로 정렬
+  const sortedProjects = useMemo(
+    () => [...projects].sort((a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0)),
+    [projects]
+  );
+  const currentProject = projects.find((p) => p.id === currentId) ?? null;
+
+  if (!ready) {
+    return (
+      <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24 }}>
+        {loadError ? (
+          <>
+            <Text style={{ color: '#b91c1c', textAlign: 'center' }}>저장된 데이터를 불러오지 못했어요.{'\n'}{loadError}</Text>
+            <TouchableOpacity onPress={init} style={[galleryStyles.secondaryBtn, { marginTop: 16 }]}>
+              <Text style={galleryStyles.secondaryText}>다시 시도</Text>
+            </TouchableOpacity>
+          </>
+        ) : (
+          <>
+            <ActivityIndicator />
+            <Text style={{ marginTop: 8, color: '#666' }}>최근 프로젝트를 불러오는 중…</Text>
+          </>
+        )}
+      </View>
+    );
+  }
+
   return (
-    <PhotoContext.Provider value={{ items, addItem, deleteItem }}>
+    <PhotoContext.Provider
+      value={{
+        items,
+        addItem,
+        updateItem,
+        deleteItem,
+        projects: sortedProjects,
+        currentProject,
+        openProject,
+        createProject,
+        deleteProject,
+        isPrefixAvailable,
+      }}>
       {children}
     </PhotoContext.Provider>
   );
@@ -93,7 +293,7 @@ function toDecimal(value, ref) {
 }
 
 // iOS({GPS} 딕셔너리) / Android(GPSLatitude 등) 모두 대응
-function getCoordsFromExif(exif) {
+export function getCoordsFromExif(exif) {
   if (!exif) return null;
   const gps = exif['{GPS}'];
   const lat = gps
@@ -107,7 +307,7 @@ function getCoordsFromExif(exif) {
   return { latitude: lat, longitude: lng };
 }
 
-const coordText = (c) => `${c.latitude.toFixed(5)}, ${c.longitude.toFixed(5)}`;
+export const coordText = (c) => `${c.latitude.toFixed(5)}, ${c.longitude.toFixed(5)}`;
 
 const validCoords = (loc) =>
   loc && typeof loc.latitude === 'number' && typeof loc.longitude === 'number' &&
@@ -116,7 +316,7 @@ const validCoords = (loc) =>
     : null;
 
 // 디버그용: EXIF 안의 GPS 관련 값만 추려서 문자열로
-function gpsDebugText(exif) {
+export function gpsDebugText(exif) {
   if (!exif) return 'exif 없음 (선택기가 메타데이터를 넘기지 않음)';
   const out = {};
   if (exif['{GPS}']) out['{GPS}'] = exif['{GPS}'];
@@ -130,7 +330,7 @@ function gpsDebugText(exif) {
  * 비동기 유틸 (타임아웃)
  * ───────────────────────────── */
 // 일정 시간 안에 끝나지 않으면 실패 처리 (기기 지오코더가 멈춰 있는 경우 대비)
-function withTimeout(promise, ms, label = '작업') {
+export function withTimeout(promise, ms, label = '작업') {
   let timer;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => reject(new Error(`${label} 시간 초과(${ms / 1000}초)`)), ms);
@@ -227,7 +427,7 @@ const cacheKey = (c) => `${c.latitude.toFixed(4)},${c.longitude.toFixed(4)}`;
 
 // 좌표 → { address, source, errors }
 // 여러 방법을 순서대로 시도하고, 하나라도 성공하면 즉시 반환
-async function resolveAddress(c) {
+export async function resolveAddress(c) {
   const key = cacheKey(c);
   if (addressCache.has(key)) return { address: addressCache.get(key), source: '캐시', errors: [] };
 
@@ -253,13 +453,13 @@ async function resolveAddress(c) {
 /* ─────────────────────────────
  * 갤러리 DB 유틸
  * ───────────────────────────── */
-async function ensureLibraryPermission() {
+export async function ensureLibraryPermission() {
   const res = await MediaLibrary.requestPermissionsAsync(false, ['photo']);
   return res.granted;
 }
 
 // 갤러리 asset에서 위치 + 표시용 uri 가져오기
-async function readAssetInfo(assetOrId) {
+export async function readAssetInfo(assetOrId) {
   const info = await withTimeout(
     MediaLibrary.getAssetInfoAsync(assetOrId, {
       shouldDownloadFromNetwork: true, // iCloud 원본만 있는 사진도 localUri 확보
@@ -278,7 +478,7 @@ async function readAssetInfo(assetOrId) {
  * ───────────────────────────── */
 const THUMB = Math.floor((Dimensions.get('window').width - 4 * 4) / 3);
 
-function GalleryModal({ visible, onClose, onSelect }) {
+export function GalleryModal({ visible, onClose, onSelect }) {
   const [assets, setAssets] = useState([]);
   const [cursor, setCursor] = useState(null);
   const [hasMore, setHasMore] = useState(true);
@@ -356,15 +556,15 @@ function GalleryModal({ visible, onClose, onSelect }) {
         <Text style={{ textAlign: 'center', color: '#555', marginTop: 8, lineHeight: 20 }}>{msg}</Text>
         <View style={{ flexDirection: 'row', gap: 8, marginTop: 16, flexWrap: 'wrap', justifyContent: 'center' }}>
           {limited && (
-            <TouchableOpacity style={styles.secondaryBtn} onPress={addAllowedPhotos}>
-              <Text style={styles.secondaryText}>허용할 사진 추가</Text>
+            <TouchableOpacity style={galleryStyles.secondaryBtn} onPress={addAllowedPhotos}>
+              <Text style={galleryStyles.secondaryText}>허용할 사진 추가</Text>
             </TouchableOpacity>
           )}
-          <TouchableOpacity style={styles.secondaryBtn} onPress={() => Linking.openSettings()}>
-            <Text style={styles.secondaryText}>설정 열기</Text>
+          <TouchableOpacity style={galleryStyles.secondaryBtn} onPress={() => Linking.openSettings()}>
+            <Text style={galleryStyles.secondaryText}>설정 열기</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.secondaryBtn} onPress={init}>
-            <Text style={styles.secondaryText}>다시 시도</Text>
+          <TouchableOpacity style={galleryStyles.secondaryBtn} onPress={init}>
+            <Text style={galleryStyles.secondaryText}>다시 시도</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -373,7 +573,7 @@ function GalleryModal({ visible, onClose, onSelect }) {
 
   return (
     <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
-      <View style={styles.modalHeader}>
+      <View style={galleryStyles.modalHeader}>
         <TouchableOpacity onPress={onClose}>
           <Text style={{ fontSize: 16, color: '#666' }}>닫기</Text>
         </TouchableOpacity>
@@ -387,7 +587,7 @@ function GalleryModal({ visible, onClose, onSelect }) {
         )}
       </View>
       {status && SHOW_DEBUG && (
-        <Text style={styles.statusLine}>
+        <Text style={galleryStyles.statusLine}>
           {Platform.OS} · 권한 {status.granted ? '허용' : '거부'} · 범위 {status.access} · 사진{' '}
           {status.total ?? '-'}장 · 표시 {assets.length}장
         </Text>
@@ -416,463 +616,8 @@ function GalleryModal({ visible, onClose, onSelect }) {
   );
 }
 
-/* ─────────────────────────────
- * 리스트 모듈
- * ───────────────────────────── */
-function PhotoListScreen({ navigation }) {
-  const { items, deleteItem } = usePhotos();
-
-  const confirmDelete = (id) => {
-    if (IS_WEB) {
-      // Snack 웹 미리보기에서는 Alert 버튼이 동작하지 않음
-      if (window.confirm('이 항목을 삭제할까요?')) deleteItem(id);
-      return;
-    }
-    Alert.alert('삭제', '이 항목을 삭제할까요?', [
-      { text: '취소', style: 'cancel' },
-      { text: '삭제', style: 'destructive', onPress: () => deleteItem(id) },
-    ]);
-  };
-
-  return (
-    <View style={styles.screen}>
-      <FlatList
-        data={items}
-        keyExtractor={(it) => it.id}
-        contentContainerStyle={items.length === 0 ? styles.emptyWrap : { padding: 16 }}
-        ListEmptyComponent={
-          <View style={{ alignItems: 'center' }}>
-            <Ionicons name="images-outline" size={48} color="#bbb" />
-            <Text style={styles.empty}>아직 등록된 사진이 없어요.</Text>
-            <TouchableOpacity
-              style={[styles.primaryBtn, { marginTop: 16 }]}
-              onPress={() => navigation.navigate('PhotoInput')}>
-              <Text style={styles.primaryBtnText}>사진 추가하기</Text>
-            </TouchableOpacity>
-          </View>
-        }
-        renderItem={({ item }) => (
-          <TouchableOpacity
-            style={styles.card}
-            activeOpacity={0.8}
-            onLongPress={() => confirmDelete(item.id)}>
-            <ExpoImage source={{ uri: item.uri }} style={styles.thumb} contentFit="cover" />
-            <View style={styles.info}>
-              <Text style={styles.title} numberOfLines={1}>{item.title}</Text>
-              <Text style={styles.location} numberOfLines={2}>
-                📍 {item.location || '위치 정보 없음'}
-              </Text>
-              {item.coords && <Text style={styles.coords}>{coordText(item.coords)}</Text>}
-            </View>
-          </TouchableOpacity>
-        )}
-      />
-    </View>
-  );
-}
-
-/* ─────────────────────────────
- * 입력 모듈
- * ───────────────────────────── */
-function PhotoInputScreen({ navigation }) {
-  const { addItem } = usePhotos();
-  const [uri, setUri] = useState(null);
-  const [title, setTitle] = useState('');
-  const [location, setLocation] = useState('');
-  const [coords, setCoords] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [note, setNote] = useState(null); // { text, warn }
-  const [debug, setDebug] = useState('');
-  const [galleryOpen, setGalleryOpen] = useState(false);
-  // 요청 번호: 주소 조회 중 다른 사진을 고르면 이전 결과가 덮어쓰지 않도록 함
-  const reqId = useRef(0);
-
-  const addDebug = (line) => setDebug((d) => (d ? `${d}\n${line}` : line));
-
-  const reset = () => {
-    reqId.current += 1; // 진행 중인 조회 무효화
-    setUri(null);
-    setTitle('');
-    setLocation('');
-    setCoords(null);
-    setLoading(false);
-    setNote(null);
-    setDebug('');
-  };
-
-  const clearLocation = () => {
-    setCoords(null);
-    setLocation('');
-  };
-
-  // 위치 없음 안내 문구 (환경별)
-  const noLocationNote = () =>
-    Platform.OS === 'android'
-      ? IS_EXPO_GO
-        ? 'Expo Go(Android)에서는 갤러리 사진의 위치를 읽을 수 없는 경우가 많아요. "촬영하고 위치 저장" 또는 "현재 위치 사용"을 쓰거나, development build로 테스트하세요.'
-        : '사진에 위치가 없거나 선택기가 위치를 지웠어요. "갤러리에서 직접 선택"을 눌러보세요.'
-      : '사진에 위치 정보가 없어요. 직접 입력하거나 현재 위치를 사용하세요.';
-
-  // 좌표를 먼저 화면에 보여주고, 주소는 비동기로 채움
-  // id: 이 요청을 시작한 요청 번호 (이미 더 새로운 요청이 있으면 결과를 버림)
-  const applyCoords = async (c, source, id = ++reqId.current) => {
-    if (id !== reqId.current) return;
-    if (!c) {
-      clearLocation();
-      setLoading(false);
-      setNote({ text: noLocationNote(), warn: true });
-      return;
-    }
-
-    setCoords(c);
-    setLocation('');
-    setLoading(true);
-    setNote({ text: '주소를 찾는 중…', warn: false });
-
-    const r = await resolveAddress(c);
-    if (id !== reqId.current) return; // 그 사이 다른 요청이 시작됨
-
-    setLoading(false);
-    if (r.errors.length) addDebug(`[주소 변환 실패 기록]\n${r.errors.join('\n')}`);
-    if (r.address) {
-      setLocation(r.address);
-      setNote({ text: `위치 출처: ${source} · 주소: ${r.source}`, warn: false });
-    } else {
-      setLocation(coordText(c));
-      setNote({
-        text: `주소 변환에 실패해 좌표로 입력했어요. 네트워크를 확인하거나 "주소 다시 찾기"를 눌러주세요.\n${r.errors.join('\n')}`,
-        warn: true,
-      });
-    }
-  };
-
-  // 갤러리 모달에서 고른 사진: 갤러리 DB의 위치 정보 사용
-  const onGallerySelect = async (asset) => {
-    setGalleryOpen(false);
-    const id = ++reqId.current;
-    setUri(asset.uri);
-    clearLocation();
-    setLoading(true);
-    setNote({ text: '사진의 위치 정보를 읽는 중…', warn: false });
-    setDebug('');
-    let c = null;
-    try {
-      const info = await readAssetInfo(asset);
-      if (id !== reqId.current) return;
-      if (info.uri) setUri(info.uri);
-      c = info.coords;
-      addDebug(`[갤러리 DB location] ${c ? coordText(c) : '없음'}`);
-    } catch (e) {
-      addDebug(`[getAssetInfoAsync 오류] ${e.message}`);
-    }
-    await applyCoords(c, '갤러리 DB', id);
-  };
-
-  // 시스템 사진 선택기로 고르기
-  const pickImage = async () => {
-    const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (!perm.granted) {
-      Alert.alert('권한 필요', '사진을 불러오려면 앨범 접근 권한이 필요해요.');
-      return;
-    }
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['images'],
-      quality: 1, // 재압축 시 EXIF가 바뀌지 않도록 원본 품질
-      exif: true, // 위치 정보 읽기에 필수
-      // Android: 새 사진 선택기는 GPS를 지우므로, 예전 방식(문서 선택기)으로 열기
-      legacy: Platform.OS === 'android',
-    });
-    if (result.canceled) return;
-
-    const asset = result.assets[0];
-    const id = ++reqId.current;
-    setUri(asset.uri);
-    clearLocation();
-    setLoading(true);
-    setNote({ text: '사진의 위치 정보를 읽는 중…', warn: false });
-    setDebug(`[EXIF] ${gpsDebugText(asset.exif)}\n[assetId] ${asset.assetId ?? '없음'}`);
-
-    // 1순위: 선택기가 넘겨준 EXIF
-    let c = getCoordsFromExif(asset.exif);
-    let source = 'EXIF';
-    // 2순위: assetId가 있으면 갤러리 DB에서 위치 조회
-    if (!c && asset.assetId && CAN_USE_MEDIA_LIBRARY) {
-      try {
-        if (await ensureLibraryPermission()) {
-          c = (await readAssetInfo(asset.assetId)).coords;
-          source = '갤러리 DB';
-        }
-      } catch (e) {
-        addDebug(`[getAssetInfoAsync 오류] ${e.message}`);
-      }
-    }
-    await applyCoords(c, source, id);
-  };
-
-  // 현재 위치를 좌표 + 주소로 채움 (촬영 직후, 또는 "현재 위치 사용" 버튼)
-  // ※ 이름이 use로 시작하면 React Hook으로 오인되므로 fill...로 변경
-  const fillCurrentLocation = async (source = '현재 위치') => {
-    const id = ++reqId.current;
-    setLoading(true);
-    setNote({ text: '현재 위치를 확인하는 중…', warn: false });
-    try {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (id !== reqId.current) return;
-      if (status !== 'granted') {
-        clearLocation();
-        setLoading(false);
-        setNote({ text: '위치 권한이 없어 위치를 저장하지 못했어요. 설정에서 위치 권한을 허용해주세요.', warn: true });
-        return;
-      }
-
-      // 빠른 응답: 1분 이내의 마지막 위치가 있으면 그대로 사용
-      let pos = null;
-      if (!IS_WEB) {
-        try {
-          pos = await Location.getLastKnownPositionAsync({ maxAge: 60_000, requiredAccuracy: 100 });
-        } catch {
-          pos = null;
-        }
-      }
-      if (!pos) {
-        pos = await withTimeout(
-          Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
-          10000,
-          '현재 위치'
-        );
-      }
-      if (id !== reqId.current) return;
-      await applyCoords({ latitude: pos.coords.latitude, longitude: pos.coords.longitude }, source, id);
-    } catch (e) {
-      if (id !== reqId.current) return;
-      clearLocation();
-      setLoading(false);
-      addDebug(`[현재 위치 오류] ${e?.message ?? e}`);
-      setNote({ text: '현재 위치를 가져오지 못했어요. GPS가 켜져 있는지 확인해주세요.', warn: true });
-    }
-  };
-
-  // 촬영 직후 현재 위치를 저장 (Expo Go에서도 동작)
-  const takePhoto = async () => {
-    const cam = await ImagePicker.requestCameraPermissionsAsync();
-    if (!cam.granted) {
-      Alert.alert('권한 필요', '카메라 권한이 필요해요.');
-      return;
-    }
-    const result = await ImagePicker.launchCameraAsync({ quality: 0.8 });
-    if (result.canceled) return;
-    setUri(result.assets[0].uri);
-    setDebug('[카메라 촬영] 현재 위치 사용');
-    await fillCurrentLocation('촬영 위치(현재 위치)');
-  };
-
-  const save = () => {
-    if (!uri) return Alert.alert('알림', '사진을 선택해주세요.');
-    if (!title.trim()) return Alert.alert('알림', '제목을 입력해주세요.');
-    addItem({ uri, title: title.trim(), location: location.trim(), coords });
-    reset();
-    navigation.navigate('ListTab', { screen: 'PhotoList' });
-  };
-
-  return (
-    <KeyboardAvoidingView
-      style={styles.screen}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-      <ScrollView contentContainerStyle={{ padding: 16 }} keyboardShouldPersistTaps="handled">
-        <TouchableOpacity style={styles.picker} onPress={pickImage} activeOpacity={0.8}>
-          {uri ? (
-            <ExpoImage source={{ uri }} style={styles.preview} contentFit="cover" />
-          ) : (
-            <View style={{ alignItems: 'center' }}>
-              <Ionicons name="camera-outline" size={40} color="#666" />
-              <Text style={styles.pickerText}>눌러서 사진 선택</Text>
-            </View>
-          )}
-        </TouchableOpacity>
-
-        <Text style={styles.label}>제목</Text>
-        <TextInput
-          style={styles.input}
-          value={title}
-          onChangeText={setTitle}
-          placeholder="제목을 입력하세요"
-          returnKeyType="done"
-        />
-
-        <Text style={styles.label}>위치</Text>
-        <View style={styles.locRow}>
-          <TextInput
-            style={[styles.input, { flex: 1 }]}
-            value={location}
-            onChangeText={setLocation}
-            placeholder="사진 선택 시 자동 입력"
-            multiline
-          />
-          {loading && <ActivityIndicator style={{ marginLeft: 8 }} />}
-        </View>
-        {coords && <Text style={styles.coords}>{coordText(coords)}</Text>}
-        {note && (
-          <Text style={[styles.note, note.warn && styles.noteWarn]}>{note.text}</Text>
-        )}
-
-        <View style={styles.btnRow}>
-          {!IS_WEB && (
-            <TouchableOpacity style={styles.secondaryBtn} onPress={takePhoto}>
-              <Ionicons name="camera-outline" size={16} color="#2563eb" />
-              <Text style={styles.secondaryText}>촬영하고 위치 저장</Text>
-            </TouchableOpacity>
-          )}
-          {CAN_USE_MEDIA_LIBRARY && (
-            <TouchableOpacity style={styles.secondaryBtn} onPress={() => setGalleryOpen(true)}>
-              <Ionicons name="images-outline" size={16} color="#2563eb" />
-              <Text style={styles.secondaryText}>갤러리에서 직접 선택</Text>
-            </TouchableOpacity>
-          )}
-          <TouchableOpacity style={styles.secondaryBtn} onPress={() => fillCurrentLocation()}>
-            <Ionicons name="locate-outline" size={16} color="#2563eb" />
-            <Text style={styles.secondaryText}>현재 위치 사용</Text>
-          </TouchableOpacity>
-          {coords && !loading && (
-            <TouchableOpacity
-              style={styles.secondaryBtn}
-              onPress={() => applyCoords(coords, '이전 좌표')}>
-              <Ionicons name="refresh-outline" size={16} color="#2563eb" />
-              <Text style={styles.secondaryText}>주소 다시 찾기</Text>
-            </TouchableOpacity>
-          )}
-        </View>
-
-        {SHOW_DEBUG && !!debug && (
-          <View style={styles.debugBox}>
-            <Text style={styles.debugTitle}>디버그 (원인 확인 후 SHOW_DEBUG = false)</Text>
-            <Text style={styles.debugText}>{debug}</Text>
-          </View>
-        )}
-
-        <GalleryModal
-          visible={galleryOpen && CAN_USE_MEDIA_LIBRARY}
-          onClose={() => setGalleryOpen(false)}
-          onSelect={onGallerySelect}
-        />
-
-        <TouchableOpacity style={[styles.primaryBtn, { marginTop: 28 }]} onPress={save}>
-          <Text style={styles.primaryBtnText}>저장</Text>
-        </TouchableOpacity>
-      </ScrollView>
-    </KeyboardAvoidingView>
-  );
-}
-
-/* ─────────────────────────────
- * 네비게이션
- * ───────────────────────────── */
-const Stack = createStackNavigator();
-const Tab = createBottomTabNavigator();
-
-const ListStack = () => (
-  <Stack.Navigator>
-    <Stack.Screen
-      name="PhotoList"
-      component={PhotoListScreen}
-      options={({ navigation }) => ({
-        title: '내 사진',
-        headerRight: () => (
-          <TouchableOpacity
-            style={{ marginRight: 16 }}
-            onPress={() => navigation.navigate('PhotoInput')}>
-            <Ionicons name="add-circle" size={28} color="tomato" />
-          </TouchableOpacity>
-        ),
-      })}
-    />
-    <Stack.Screen
-      name="PhotoInput"
-      component={PhotoInputScreen}
-      options={{ title: '사진 등록' }}
-    />
-  </Stack.Navigator>
-);
-
-const InputStack = () => (
-  <Stack.Navigator>
-    <Stack.Screen
-      name="PhotoInputTab"
-      component={PhotoInputScreen}
-      options={{ title: '사진 등록' }}
-    />
-  </Stack.Navigator>
-);
-
-export default function App() {
-  return (
-    <PhotoProvider>
-      <NavigationContainer>
-        <Tab.Navigator
-          screenOptions={({ route }) => ({
-            headerShown: false,
-            tabBarActiveTintColor: 'tomato',
-            tabBarInactiveTintColor: 'gray',
-            tabBarIcon: ({ color, size }) => {
-              const iconName = route.name === 'ListTab' ? 'list' : 'add-circle-outline';
-              return <Ionicons name={iconName} size={size} color={color} />;
-            },
-          })}>
-          <Tab.Screen name="ListTab" component={ListStack} options={{ title: '목록' }} />
-          <Tab.Screen name="InputTab" component={InputStack} options={{ title: '등록' }} />
-        </Tab.Navigator>
-      </NavigationContainer>
-    </PhotoProvider>
-  );
-}
-
-/* ─────────────────────────────
- * 스타일
- * ───────────────────────────── */
-const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: '#f6f7f9' },
-  emptyWrap: { flexGrow: 1, justifyContent: 'center', alignItems: 'center' },
-  empty: { marginTop: 8, color: '#888' },
-  card: {
-    flexDirection: 'row',
-    backgroundColor: '#fff',
-    borderRadius: 12,
-    padding: 10,
-    marginBottom: 10,
-    shadowColor: '#000',
-    shadowOpacity: 0.06,
-    shadowRadius: 6,
-    shadowOffset: { width: 0, height: 2 },
-    elevation: 2,
-  },
-  thumb: { width: 72, height: 72, borderRadius: 8, backgroundColor: '#eee' },
-  info: { flex: 1, marginLeft: 12, justifyContent: 'center' },
-  title: { fontSize: 16, fontWeight: '600', color: '#111' },
-  location: { fontSize: 13, color: '#555', marginTop: 4 },
-  coords: { fontSize: 11, color: '#999', marginTop: 4 },
-  picker: {
-    height: 240,
-    borderRadius: 12,
-    backgroundColor: '#e5e7eb',
-    justifyContent: 'center',
-    alignItems: 'center',
-    overflow: 'hidden',
-  },
-  pickerText: { color: '#555', fontSize: 15, marginTop: 6 },
-  preview: { width: '100%', height: '100%' },
-  label: { marginTop: 20, marginBottom: 6, fontWeight: '600', color: '#333' },
-  input: {
-    backgroundColor: '#fff',
-    borderWidth: 1,
-    borderColor: '#d1d5db',
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    fontSize: 15,
-  },
-  locRow: { flexDirection: 'row', alignItems: 'center' },
-  note: { marginTop: 6, fontSize: 13, color: '#4b5563' },
-  noteWarn: { color: '#d97706' },
-  btnRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 4 },
+// 갤러리 모달 전용 스타일 (Home.js의 styles와 별개)
+const galleryStyles = StyleSheet.create({
   secondaryBtn: {
     marginTop: 8,
     flexDirection: 'row',
@@ -885,18 +630,7 @@ const styles = StyleSheet.create({
     borderColor: '#2563eb',
   },
   secondaryText: { color: '#2563eb', fontWeight: '600' },
-  primaryBtn: {
-    backgroundColor: 'tomato',
-    paddingVertical: 14,
-    paddingHorizontal: 20,
-    borderRadius: 10,
-    alignItems: 'center',
-  },
-  primaryBtnText: { color: '#fff', fontWeight: '700', fontSize: 16 },
   statusLine: { fontSize: 11, color: '#64748b', paddingHorizontal: 12, paddingVertical: 6, backgroundColor: '#f8fafc' },
-  debugBox: { marginTop: 16, padding: 10, borderRadius: 8, backgroundColor: '#f1f5f9' },
-  debugTitle: { fontSize: 11, fontWeight: '700', color: '#64748b', marginBottom: 4 },
-  debugText: { fontSize: 11, color: '#334155', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
   modalHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -908,3 +642,17 @@ const styles = StyleSheet.create({
     borderColor: '#ddd',
   },
 });
+
+/* ─────────────────────────────
+ * 앱 시작점: 실행하면 Home.js를 엽니다
+ * ───────────────────────────── */
+export default function App() {
+  // Home.js가 이 파일(App.js)의 유틸을 import하므로,
+  // 맨 위에서 import하면 순환 참조가 생깁니다 → 여기서 불러와 순환을 피함
+  const Home = require('./Home').default;
+  return (
+    <PhotoProvider>
+      <Home />
+    </PhotoProvider>
+  );
+}
