@@ -11,6 +11,8 @@ import {
   Platform,
   StyleSheet,
   Share,
+  Modal,
+  FlatList,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
@@ -30,6 +32,11 @@ import {
   ensureLibraryPermission,
   readAssetInfo,
 } from './App';
+// 프로젝트 복사: 다른 프로젝트의 사진 목록을 직접 읽고 씀 (App.js와 같은 저장 방식)
+import { loadItems, saveItems, typeIcon, typeLabel } from './storage';
+// expo-file-system 18 (Expo SDK 52 / Snack) 은 '/legacy' 경로가 없음 → 기본 경로 사용
+// SDK 54 이상으로 올리면 'expo-file-system/legacy' 로 바꾸세요 (storage.js와 같게)
+import * as FileSystem from 'expo-file-system';
 
 /* ─────────────────────────────
  * 주소 → 제목 (마지막 동/지역 이름)
@@ -122,6 +129,37 @@ async function sharePhoto({ uri, title, description }) {
 }
 
 /* ─────────────────────────────
+ * 다른 프로젝트로 사진 1장 복사 (지금 프로젝트에도 그대로 남음)
+ * ─────────────────────────────
+ * - 사진 파일을 대상 프로젝트 폴더(documentDirectory/photos/{prefix}/)로 새로 복사
+ * - 대상 프로젝트의 사진 목록 맨 앞에 추가 ({prefix}:items)
+ */
+async function copyPhotoFile(uri, prefix) {
+  if (IS_WEB || !uri || !FileSystem.documentDirectory) return uri; // 웹은 파일 복사 없음
+  const dir = `${FileSystem.documentDirectory}photos/${prefix}/`;
+  await FileSystem.makeDirectoryAsync(dir, { intermediates: true }).catch(() => {});
+  const ext = (uri.split('?')[0].match(/\.([A-Za-z0-9]{3,4})$/)?.[1] ?? 'jpg').toLowerCase();
+  const dest = `${dir}${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
+  await FileSystem.copyAsync({ from: uri, to: dest });
+  return dest;
+}
+
+async function addToProject(target, data) {
+  const uri = await copyPhotoFile(data.uri, target.prefix);
+  const now = Date.now();
+  const newItem = {
+    ...data,
+    uri,
+    id: `${now}${Math.floor(Math.random() * 1000)}`, // 대상 프로젝트에서 쓸 새 id
+    createdAt: data.createdAt ?? now,
+    updatedAt: now,
+  };
+  const list = await loadItems(target.prefix);
+  await saveItems(target.prefix, [newItem, ...(Array.isArray(list) ? list : [])]);
+  return newItem;
+}
+
+/* ─────────────────────────────
  * 수정 모듈
  * navigation.navigate('PhotoEdit', { id: item.id }) 로 열기
  * ───────────────────────────── */
@@ -159,6 +197,8 @@ export default function PhotoEditScreen({ route, navigation }) {
   const [loading, setLoading] = useState(false);
   const [note, setNote] = useState(null); // { text, warn }
   const [sharing, setSharing] = useState(false); // 공유 창 여는 중
+  const [copyOpen, setCopyOpen] = useState(false); // 프로젝트 복사 창
+  const [copying, setCopying] = useState(false);
   // 주소 조회 중 다른 요청이 시작되면 이전 결과를 버리기 위한 번호
   const reqId = useRef(0);
   // 저장 후 화면을 닫을 때는 "변경 취소" 확인을 띄우지 않음
@@ -375,6 +415,51 @@ export default function PhotoEditScreen({ route, navigation }) {
     go();
   };
 
+  // 복사할 수 있는 다른 프로젝트 (최근 사용 순)
+  const otherProjects = (photos.projects ?? []).filter((p) => p.id !== photos.currentProject?.id);
+
+  const ask = (title, msg, okText, onOk) => {
+    if (IS_WEB) {
+      if (window.confirm(`${title}\n${msg}`)) onOk();
+      return;
+    }
+    Alert.alert(title, msg, [
+      { text: '취소', style: 'cancel' },
+      { text: okText, onPress: onOk },
+    ]);
+  };
+  const tell = (title, msg) => (IS_WEB ? window.alert(`${title}\n${msg}`) : Alert.alert(title, msg));
+
+  // 프로젝트를 고르면 확인 후 복사 (지금 화면의 내용 그대로, 저장 전 수정 내용 포함)
+  const copyTo = (target) => {
+    ask(
+      '프로젝트 복사',
+      `"${title.trim() || item.title}"을(를) "${target.name}" 프로젝트로 복사할까요?\n지금 프로젝트에도 그대로 남아요.`,
+      '복사',
+      async () => {
+        if (copying) return;
+        setCopying(true);
+        try {
+          await addToProject(target, {
+            ...item,
+            uri,
+            title: title.trim() || item.title,
+            location: location.trim(),
+            coords,
+            description: description.trim(),
+          });
+        } catch (e) {
+          setCopying(false);
+          tell('복사 실패', e?.message ?? String(e));
+          return;
+        }
+        setCopying(false);
+        setCopyOpen(false);
+        tell('복사 완료', `"${target.name}" 프로젝트에 복사했어요.`);
+      }
+    );
+  };
+
   const remove = () => {
     const doDelete = () => {
       saved.current = true;
@@ -485,11 +570,73 @@ export default function PhotoEditScreen({ route, navigation }) {
           )}
         </TouchableOpacity>
 
+        {/* 다른 프로젝트로 복사 */}
+        <TouchableOpacity style={styles.shareBtn} onPress={() => setCopyOpen(true)}>
+          <Ionicons name="copy-outline" size={16} color="#2563eb" />
+          <Text style={styles.shareText}>다른 프로젝트로 복사</Text>
+        </TouchableOpacity>
+
         <TouchableOpacity style={styles.deleteBtn} onPress={remove}>
           <Ionicons name="trash-outline" size={16} color="#dc2626" />
           <Text style={styles.deleteText}>삭제</Text>
         </TouchableOpacity>
       </ScrollView>
+
+      {/* 프로젝트 복사 창 */}
+      <Modal
+        visible={copyOpen}
+        transparent
+        animationType="slide"
+        onRequestClose={() => !copying && setCopyOpen(false)}>
+        <View style={styles.sheetBackdrop}>
+          <View style={styles.sheet}>
+            <View style={styles.sheetHeader}>
+              <Text style={styles.sheetTitle}>다른 프로젝트로 복사</Text>
+              <TouchableOpacity
+                onPress={() => setCopyOpen(false)}
+                disabled={copying}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                <Ionicons name="close" size={24} color="#555" />
+              </TouchableOpacity>
+            </View>
+
+            <Text style={styles.sheetSub}>
+              지금 프로젝트: {photos.currentProject?.name ?? '-'} · 복사할 프로젝트를 고르세요
+            </Text>
+
+            {copying ? (
+              <View style={{ padding: 30, alignItems: 'center' }}>
+                <ActivityIndicator />
+                <Text style={{ marginTop: 8, color: '#666' }}>복사하는 중…</Text>
+              </View>
+            ) : (
+              <FlatList
+                data={otherProjects}
+                keyExtractor={(p) => p.id}
+                style={{ maxHeight: 360 }}
+                ListEmptyComponent={
+                  <Text style={styles.sheetEmpty}>
+                    다른 프로젝트가 없어요.{'\n'}목록 화면의 프로젝트 메뉴에서 새 프로젝트를 먼저 만들어 주세요.
+                  </Text>
+                }
+                renderItem={({ item: p }) => (
+                  <TouchableOpacity style={styles.projectRow} onPress={() => copyTo(p)}>
+                    <Ionicons name={typeIcon(p.type)} size={18} color="tomato" />
+                    <View style={{ flex: 1, marginLeft: 10 }}>
+                      <Text style={styles.projectName} numberOfLines={1}>{p.name}</Text>
+                      <Text style={styles.projectMeta}>
+                        {typeLabel(p.type)}
+                        {Number.isFinite(p.count) ? ` · 사진 ${p.count}장` : ''}
+                      </Text>
+                    </View>
+                    <Ionicons name="copy-outline" size={18} color="#bbb" />
+                  </TouchableOpacity>
+                )}
+              />
+            )}
+          </View>
+        </View>
+      </Modal>
     </KeyboardAvoidingView>
   );
 }
@@ -570,6 +717,28 @@ const styles = StyleSheet.create({
     backgroundColor: '#fff',
   },
   shareText: { color: '#2563eb', fontWeight: '600' },
+  // 프로젝트 복사 창
+  sheetBackdrop: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.35)' },
+  sheet: {
+    backgroundColor: '#fff',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    padding: 16,
+    paddingBottom: Platform.OS === 'ios' ? 34 : 16,
+  },
+  sheetHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  sheetTitle: { fontSize: 17, fontWeight: '700', color: '#111' },
+  sheetSub: { marginTop: 14, marginBottom: 6, fontSize: 12, color: '#6b7280' },
+  sheetEmpty: { padding: 24, textAlign: 'center', color: '#888', lineHeight: 20 },
+  projectRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#e5e7eb',
+  },
+  projectName: { fontSize: 15, fontWeight: '600', color: '#111' },
+  projectMeta: { marginTop: 2, fontSize: 12, color: '#888' },
   deleteBtn: {
     marginTop: 12,
     flexDirection: 'row',
