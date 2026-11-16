@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -14,6 +14,7 @@ import {
   Linking,
 } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { createStackNavigator } from '@react-navigation/stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { Ionicons } from '@expo/vector-icons';
@@ -46,7 +47,7 @@ import { typeIcon, typeLabel } from './storage';
 // 키워드 검색 (목록·리스트보기·보기 화면 공용)
 import { SearchBar, NoResult } from './Search';
 // 날짜 표시 + 날짜 포함 검색 (보기 화면과 공용)
-import { ymd, photoDate, formatDate, searchItems } from './Datesearch';
+import { ymd, photoDate, formatDate, searchItems, sortByDate } from './Datesearch';
 export { photoDate, formatDate, searchItems };
 // 보기 화면 (사진만 3장씩)
 import PhotoShortViewScreen from './Photoshortview';
@@ -95,13 +96,167 @@ function useDeleteItem() {
   };
 }
 
+/* ─────────────────────────────
+ * 공용 설정: 보기 방식(카드/리스트) · 날짜 정렬(최신순/오래된순)
+ * 앱이 켜져 있는 동안 화면을 오가도 유지 (앱을 다시 켜면 카드보기 · 최신순)
+ * ───────────────────────────── */
+function createShared(initial) {
+  let value = initial;
+  const listeners = new Set();
+  return function useShared() {
+    const [v, setLocal] = useState(value);
+    useEffect(() => {
+      listeners.add(setLocal);
+      setLocal(value); // 다른 화면에서 바꾼 값 반영
+      return () => listeners.delete(setLocal);
+    }, []);
+    const set = (next) => {
+      value = next;
+      listeners.forEach((fn) => fn(next));
+    };
+    return [v, set];
+  };
+}
+const useSortOrder = createShared('new'); // 'new' 최신순 | 'old' 오래된순 (찍은 날짜, 없으면 저장 날짜)
+const useViewMode = createShared('card'); // 'card' 카드보기 | 'list' 리스트보기
+
+/* ─────────────────────────────
+ * 상단 헤더: [폴더] 프로젝트 이름 ▼ ─── [카드보기/리스트보기 토글] ─── [+]
+ * 토글은 프로젝트 이름과 + 버튼 사이 가운데에 위치
+ * ───────────────────────────── */
+function MainHeader({ navigation }) {
+  const insets = useSafeAreaInsets();
+  const [mode, setMode] = useViewMode();
+  const isCard = mode === 'card';
+  return (
+    <View style={[styles.mainHeader, { paddingTop: insets.top }]}>
+      <View style={styles.mainHeaderRow}>
+        {/* 왼쪽: 프로젝트 목록 버튼 + 프로젝트 이름 */}
+        <TouchableOpacity
+          onPress={() => navigation.navigate('ProjectList')}
+          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+          <Ionicons name="folder-open-outline" size={24} color="tomato" />
+        </TouchableOpacity>
+        <View style={{ marginLeft: 10 }}>
+          <ProjectHeaderTitle onPress={() => navigation.navigate('ProjectList')} />
+        </View>
+
+        {/* 가운데: 보기 방식 토글 (누를 때마다 카드보기 ↔ 리스트보기) */}
+        <View style={styles.mainHeaderCenter}>
+          <TouchableOpacity
+            style={styles.toggleBtn}
+            activeOpacity={0.7}
+            onPress={() => setMode(isCard ? 'list' : 'card')}>
+            <Ionicons name={isCard ? 'list-outline' : 'albums-outline'} size={16} color="tomato" />
+            {/* 버튼 글자 = 누르면 바뀔 보기 */}
+            <Text style={styles.toggleText}>{isCard ? '리스트보기' : '카드보기'}</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* 오른쪽: 사진 추가 */}
+        <TouchableOpacity onPress={() => navigation.navigate('PhotoInput')}>
+          <Ionicons name="add-circle" size={28} color="tomato" />
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+}
+
+// 화면 가운데 아래: 정렬 토글 (누를 때마다 최신순 ↔ 오래된순, 글자 = 지금 정렬)
+function SortToggle({ value, onChange }) {
+  const isNew = value === 'new';
+  return (
+    <View style={styles.sortWrap} pointerEvents="box-none">
+      <TouchableOpacity
+        style={styles.sortToggle}
+        activeOpacity={0.8}
+        onPress={() => onChange(isNew ? 'old' : 'new')}>
+        <Ionicons name={isNew ? 'arrow-down' : 'arrow-up'} size={14} color="#fff" />
+        <Text style={styles.sortToggleText}>{isNew ? '최신순' : '오래된순'}</Text>
+        <Ionicons name="swap-vertical" size={14} color="rgba(255,255,255,0.8)" />
+      </TouchableOpacity>
+    </View>
+  );
+}
+
+/* ─────────────────────────────
+ * 목록 화면: 카드보기 / 리스트보기를 한 화면에서 전환
+ * ───────────────────────────── */
 function PhotoHomeScreen({ navigation }) {
   const { items } = usePhotos();
   const confirmDelete = useDeleteItem();
   const [query, setQuery] = useState('');
-  const shown = useMemo(() => searchItems(items, query), [items, query]);
+  const [order, setOrder] = useSortOrder();
+  const [mode] = useViewMode();
+  const shown = useMemo(
+    () => sortByDate(searchItems(items, query), order),
+    [items, query, order]
+  );
   const searching = !!query.trim();
   const [slideIndex, setSlideIndex] = useState(null); // 슬라이드 쇼 시작 위치 (null = 닫힘)
+
+  // 카드보기: 사진 → 슬라이드 쇼, 글자 → 수정, 오른쪽 → 지도
+  const renderCard = ({ item, index }) => (
+    <View style={styles.card}>
+      <TouchableOpacity activeOpacity={0.8} onPress={() => setSlideIndex(index)}>
+        <ExpoImage source={{ uri: item.uri }} style={styles.thumb} contentFit="cover" />
+      </TouchableOpacity>
+      {/* 글자: 누르면 수정 화면, 길게 누르면 삭제 */}
+      <TouchableOpacity
+        style={styles.info}
+        activeOpacity={0.6}
+        onPress={() => navigation.navigate('PhotoEdit', { id: item.id })}
+        onLongPress={() => confirmDelete(item)}>
+        <LinkText style={styles.title} numberOfLines={1}>{item.title}</LinkText>
+        <LinkText style={styles.location} numberOfLines={2}>
+          {`📍 ${item.location || '위치 정보 없음'}`}
+        </LinkText>
+        {!!item.description && (
+          <LinkText style={styles.desc} numberOfLines={2}>{item.description}</LinkText>
+        )}
+      </TouchableOpacity>
+      <TouchableOpacity
+        style={styles.mapIconBtn}
+        onPress={() => openMap(item)}
+        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+        <Ionicons name="map-outline" size={20} color="#2563eb" />
+        <Text style={styles.mapIconText}>지도</Text>
+      </TouchableOpacity>
+    </View>
+  );
+
+  // 리스트보기: 촬영일 · 제목/주소(누르면 수정) · 지도보기
+  const renderRow = ({ item }) => {
+    const date = photoDate(item);
+    return (
+      <View style={styles.row}>
+        <View style={{ width: 82 }}>
+          <Text style={styles.rowDate}>{date.text}</Text>
+          {/* 촬영일이 없어 등록일을 보여줄 때 표시 */}
+          {!date.taken && date.text !== '날짜 없음' && (
+            <Text style={styles.rowDateSub}>등록일</Text>
+          )}
+        </View>
+        {/* 제목/주소: 누르면 수정 화면, 길게 누르면 삭제 */}
+        <TouchableOpacity
+          style={{ flex: 1, marginRight: 8 }}
+          activeOpacity={0.6}
+          onPress={() => navigation.navigate('PhotoEdit', { id: item.id })}
+          onLongPress={() => confirmDelete(item)}>
+          <LinkText style={[styles.rowTitle, styles.rowLink]} numberOfLines={1}>{item.title}</LinkText>
+          <Text style={styles.rowAddr} numberOfLines={1}>
+            📍 {shortAddress(item.location)}
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.mapBtn} onPress={() => openMap(item)}>
+          <Ionicons name="map-outline" size={14} color="#2563eb" />
+          <Text style={styles.mapBtnText}>지도보기</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  };
+
+  const isCard = mode === 'card';
 
   return (
     <View style={styles.screen}>
@@ -109,57 +264,42 @@ function PhotoHomeScreen({ navigation }) {
         <SearchBar value={query} onChange={setQuery} total={items.length} shown={shown.length} />
       )}
       <FlatList
+        key={mode} // 보기 방식을 바꾸면 목록을 새로 그림
         data={shown}
         keyExtractor={(it) => it.id}
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="on-drag"
-        contentContainerStyle={shown.length === 0 ? styles.emptyWrap : { padding: 16, paddingTop: 8 }}
+        contentContainerStyle={
+          shown.length === 0 ? styles.emptyWrap : { padding: 16, paddingTop: 8, paddingBottom: 90 } // 아래 정렬 버튼 자리
+        }
         ListEmptyComponent={
           searching ? (
             <NoResult query={query} onClear={() => setQuery('')} />
           ) : (
-          <View style={{ alignItems: 'center' }}>
-            <Ionicons name="images-outline" size={48} color="#bbb" />
-            <Text style={styles.empty}>아직 등록된 사진이 없어요.</Text>
-            <TouchableOpacity
-              style={[styles.primaryBtn, { marginTop: 16 }]}
-              onPress={() => navigation.navigate('PhotoInput')}>
-              <Text style={styles.primaryBtnText}>사진 추가하기</Text>
-            </TouchableOpacity>
-          </View>
+            <View style={{ alignItems: 'center' }}>
+              <Ionicons name="images-outline" size={48} color="#bbb" />
+              <Text style={styles.empty}>아직 등록된 사진이 없어요.</Text>
+              <TouchableOpacity
+                style={[styles.primaryBtn, { marginTop: 16 }]}
+                onPress={() => navigation.navigate('PhotoInput')}>
+                <Text style={styles.primaryBtnText}>사진 추가하기</Text>
+              </TouchableOpacity>
+            </View>
           )
         }
-        renderItem={({ item, index }) => (
-          <View style={styles.card}>
-            {/* 사진: 누르면 현재 검색 결과 기준 슬라이드 쇼 */}
-            <TouchableOpacity activeOpacity={0.8} onPress={() => setSlideIndex(index)}>
-              <ExpoImage source={{ uri: item.uri }} style={styles.thumb} contentFit="cover" />
-            </TouchableOpacity>
-            {/* 글자: 누르면 수정 화면, 길게 누르면 삭제 */}
-            <TouchableOpacity
-              style={styles.info}
-              activeOpacity={0.6}
-              onPress={() => navigation.navigate('PhotoEdit', { id: item.id })}
-              onLongPress={() => confirmDelete(item)}>
-              <LinkText style={styles.title} numberOfLines={1}>{item.title}</LinkText>
-              <LinkText style={styles.location} numberOfLines={2}>
-                {`📍 ${item.location || '위치 정보 없음'}`}
-              </LinkText>
-              {!!item.description && (
-                <LinkText style={styles.desc} numberOfLines={2}>{item.description}</LinkText>
-              )}
-            </TouchableOpacity>
-            {/* 지도보기 버튼 (삭제 아이콘 대신) */}
-            <TouchableOpacity
-              style={styles.mapIconBtn}
-              onPress={() => openMap(item)}
-              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
-              <Ionicons name="map-outline" size={20} color="#2563eb" />
-              <Text style={styles.mapIconText}>지도</Text>
-            </TouchableOpacity>
-          </View>
-        )}
+        ListHeaderComponent={
+          !isCard && shown.length > 0 ? (
+            <View style={styles.rowHeader}>
+              <Text style={[styles.rowHeaderText, { width: 82 }]}>촬영일</Text>
+              <Text style={[styles.rowHeaderText, { flex: 1 }]}>제목 / 주소</Text>
+              <Text style={styles.rowHeaderText}>지도</Text>
+            </View>
+          ) : null
+        }
+        renderItem={isCard ? renderCard : renderRow}
       />
+
+      {shown.length > 1 && <SortToggle value={order} onChange={setOrder} />}
 
       <SlideShow
         visible={slideIndex !== null}
@@ -308,75 +448,15 @@ export async function openMap(item) {
 /* ─────────────────────────────
  * 리스트보기 모듈 (사진 제외, 텍스트만)
  * ───────────────────────────── */
+// 예전 "리스트보기" 화면 이름으로 들어와도 같은 목록 화면을 리스트보기로 보여줌
 function PhotoTextListScreen({ navigation }) {
-  const { items } = usePhotos();
-  const confirmDelete = useDeleteItem();
-  const [query, setQuery] = useState('');
-  const shown = useMemo(() => searchItems(items, query), [items, query]);
-
-  return (
-    <View style={styles.screen}>
-      {items.length > 0 && (
-        <SearchBar value={query} onChange={setQuery} total={items.length} shown={shown.length} />
-      )}
-      <FlatList
-        data={shown}
-        keyExtractor={(it) => it.id}
-        keyboardShouldPersistTaps="handled"
-        keyboardDismissMode="on-drag"
-        contentContainerStyle={shown.length === 0 ? styles.emptyWrap : { padding: 16, paddingTop: 8 }}
-        ListEmptyComponent={
-          query.trim() ? (
-            <NoResult query={query} onClear={() => setQuery('')} />
-          ) : (
-            <Text style={styles.empty}>아직 등록된 사진이 없어요.</Text>
-          )
-        }
-        ListHeaderComponent={
-          shown.length > 0 ? (
-            <View style={styles.rowHeader}>
-              <Text style={[styles.rowHeaderText, { width: 82 }]}>촬영일</Text>
-              <Text style={[styles.rowHeaderText, { flex: 1 }]}>제목 / 주소</Text>
-              <Text style={styles.rowHeaderText}>지도 / 삭제</Text>
-            </View>
-          ) : null
-        }
-        renderItem={({ item }) => {
-          const date = photoDate(item);
-          return (
-          <View style={styles.row}>
-            <View style={{ width: 82 }}>
-              <Text style={styles.rowDate}>{date.text}</Text>
-              {/* 촬영일이 없어 등록일을 보여줄 때 표시 */}
-              {!date.taken && date.text !== '날짜 없음' && (
-                <Text style={styles.rowDateSub}>등록일</Text>
-              )}
-            </View>
-            {/* 제목/주소를 누르면 수정 화면(PhotoEdit.js) */}
-            <TouchableOpacity
-              style={{ flex: 1, marginRight: 8 }}
-              activeOpacity={0.6}
-              onPress={() => navigation.navigate('PhotoEdit', { id: item.id })}>
-              <LinkText style={[styles.rowTitle, styles.rowLink]} numberOfLines={1}>{item.title}</LinkText>
-              <Text style={styles.rowAddr} numberOfLines={1}>
-                📍 {shortAddress(item.location)}
-              </Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.mapBtn} onPress={() => openMap(item)}>
-              <Ionicons name="map-outline" size={14} color="#2563eb" />
-              <Text style={styles.mapBtnText}>지도보기</Text>
-            </TouchableOpacity>
-            {/* Delete 버튼 */}
-            <TouchableOpacity style={styles.delBtn} onPress={() => confirmDelete(item)}>
-              <Ionicons name="trash-outline" size={14} color="#dc2626" />
-              <Text style={styles.delBtnText}>삭제</Text>
-            </TouchableOpacity>
-          </View>
-          );
-        }}
-      />
-    </View>
-  );
+  const [, setMode] = useViewMode();
+  useEffect(() => {
+    setMode('list');
+    navigation.navigate('PhotoList');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return null;
 }
 
 /* ─────────────────────────────
@@ -781,35 +861,11 @@ const ListStack = () => (
     <Stack.Screen
       name="PhotoList"
       component={PhotoHomeScreen}
-      options={({ navigation }) => ({
+      options={{
         title: '내 사진',
-        // 제목 = 현재 프로젝트 이름 (누르면 프로젝트 목록)
-        headerTitle: () => (
-          <ProjectHeaderTitle onPress={() => navigation.navigate('ProjectList')} />
-        ),
-        // 왼쪽: 프로젝트 목록 버튼
-        headerLeft: () => (
-          <TouchableOpacity
-            style={{ marginLeft: 16 }}
-            onPress={() => navigation.navigate('ProjectList')}>
-            <Ionicons name="folder-open-outline" size={24} color="tomato" />
-          </TouchableOpacity>
-        ),
-        // 제목(내 사진)과 + 버튼 사이에 "리스트보기" 버튼
-        headerRight: () => (
-          <View style={styles.headerRight}>
-            <TouchableOpacity
-              style={styles.listBtn}
-              onPress={() => navigation.navigate('PhotoTextList')}>
-              <Ionicons name="list-outline" size={16} color="tomato" />
-              <Text style={styles.listBtnText}>리스트보기</Text>
-            </TouchableOpacity>
-            <TouchableOpacity onPress={() => navigation.navigate('PhotoInput')}>
-              <Ionicons name="add-circle" size={28} color="tomato" />
-            </TouchableOpacity>
-          </View>
-        ),
-      })}
+        // 직접 만든 헤더: 프로젝트 이름 ─ [카드보기/리스트보기 토글] ─ [+]
+        header: ({ navigation }) => <MainHeader navigation={navigation} />,
+      }}
     />
     <Stack.Screen
       name="PhotoTextList"
@@ -1017,6 +1073,41 @@ const styles = StyleSheet.create({
     borderColor: 'tomato',
   },
   listBtnText: { color: 'tomato', fontSize: 13, fontWeight: '600' },
+  // 직접 만든 상단 헤더
+  mainHeader: {
+    backgroundColor: '#fff',
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#d1d5db',
+  },
+  mainHeaderRow: { height: 56, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16 },
+  mainHeaderCenter: { flex: 1, alignItems: 'center', paddingHorizontal: 8 },
+  toggleBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: 'tomato',
+  },
+  toggleText: { color: 'tomato', fontSize: 13, fontWeight: '700' },
+  // 화면 아래 정렬 토글
+  sortToggle: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 18,
+    paddingVertical: 10,
+    borderRadius: 22,
+    backgroundColor: 'tomato',
+    shadowColor: '#000',
+    shadowOpacity: 0.18,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 5,
+  },
+  sortToggleText: { color: '#fff', fontSize: 14, fontWeight: '700' },
   // 리스트보기 화면
   rowHeader: {
     flexDirection: 'row',
@@ -1056,23 +1147,11 @@ const styles = StyleSheet.create({
     borderColor: '#2563eb',
   },
   mapBtnText: { color: '#2563eb', fontSize: 12, fontWeight: '600' },
-  // Delete 버튼
+  // 목록 화면 아래 정렬 버튼 위치
+  sortWrap: { position: 'absolute', left: 0, right: 0, bottom: 20, alignItems: 'center' },
   // 목록 카드의 지도보기 버튼
   mapIconBtn: { justifyContent: 'center', alignItems: 'center', paddingLeft: 8 },
   mapIconText: { fontSize: 10, color: '#2563eb', marginTop: 2, fontWeight: '600' },
-  delBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 3,
-    marginLeft: 6,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 6,
-    borderWidth: 1,
-    borderColor: '#fecaca',
-    backgroundColor: '#fff',
-  },
-  delBtnText: { color: '#dc2626', fontSize: 12, fontWeight: '600' },
   debugBox: { marginTop: 16, padding: 10, borderRadius: 8, backgroundColor: '#f1f5f9' },
   debugTitle: { fontSize: 11, fontWeight: '700', color: '#64748b', marginBottom: 4 },
   debugText: { fontSize: 11, color: '#334155', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },

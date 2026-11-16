@@ -25,6 +25,28 @@ export function photoDate(item) {
   return created ? { text: created, taken: false } : { text: '날짜 없음', taken: false };
 }
 
+// 정렬용 시각(ms): 찍은 날짜 우선, 없으면 저장된 날짜, 둘 다 없으면 null
+export function photoTime(item) {
+  if (Number.isFinite(item.takenAt) && item.takenAt > 0) return item.takenAt;
+  let ts = item.createdAt;
+  if (!ts && /^\d{12,}$/.test(String(item.id))) ts = Number(item.id);
+  return Number.isFinite(ts) && ts > 0 ? ts : null;
+}
+
+// 날짜순 정렬: order = 'new'(최신순) | 'old'(오래된순)
+// 날짜가 없는 항목은 어느 순서든 맨 뒤
+export function sortByDate(items, order = 'new') {
+  const dir = order === 'old' ? 1 : -1;
+  return [...items].sort((a, b) => {
+    const ta = photoTime(a);
+    const tb = photoTime(b);
+    if (ta == null && tb == null) return 0;
+    if (ta == null) return 1;
+    if (tb == null) return -1;
+    return (ta - tb) * dir;
+  });
+}
+
 // 예전 코드 호환용: 날짜 문자열만 필요할 때
 export function formatDate(item) {
   return photoDate(item).text;

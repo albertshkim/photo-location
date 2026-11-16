@@ -10,11 +10,14 @@ import {
   KeyboardAvoidingView,
   Platform,
   StyleSheet,
+  Share,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import * as Location from 'expo-location';
 import { Image as ExpoImage } from 'expo-image';
+import * as Sharing from 'expo-sharing'; // 사진 파일 공유 (Android)
+import * as Clipboard from 'expo-clipboard'; // Android: 제목+설명을 복사해 두기
 
 import {
   IS_WEB,
@@ -55,6 +58,70 @@ export function titleFromAddress(address) {
 }
 
 /* ─────────────────────────────
+ * 사진 공유: 사진 + 제목 + 설명만 보냄 (위치·좌표·날짜는 보내지 않음)
+ * ─────────────────────────────
+ * - iOS : 공유 창 한 번에 사진 + 글(제목·설명)
+ * - Android : 기본 공유 창은 사진과 글을 함께 못 보냄
+ *             → 제목·설명을 클립보드에 복사해 두고 사진을 공유 (받는 앱에서 붙여넣기)
+ * - 웹 : 브라우저가 지원하면 사진 파일 + 글, 아니면 글만
+ */
+const shareText = (title, description) =>
+  [title?.trim(), description?.trim()].filter(Boolean).join('\n\n');
+
+const mimeFromUri = (uri) => {
+  const ext = (uri.split('?')[0].split('.').pop() || '').toLowerCase();
+  if (ext === 'png') return 'image/png';
+  if (ext === 'webp') return 'image/webp';
+  if (ext === 'heic' || ext === 'heif') return 'image/heic';
+  if (ext === 'gif') return 'image/gif';
+  return 'image/jpeg';
+};
+
+async function sharePhoto({ uri, title, description }) {
+  const text = shareText(title, description);
+
+  // 웹
+  if (IS_WEB) {
+    try {
+      if (navigator.share) {
+        let files;
+        try {
+          const blob = await (await fetch(uri)).blob();
+          const file = new File([blob], `${(title || 'photo').trim()}.${blob.type.split('/')[1] || 'jpg'}`, {
+            type: blob.type || 'image/jpeg',
+          });
+          if (navigator.canShare?.({ files: [file] })) files = [file];
+        } catch {}
+        await navigator.share({ title: title || '사진', text, ...(files ? { files } : {}) });
+      } else {
+        window.alert('이 브라우저는 공유를 지원하지 않아요.');
+      }
+    } catch (e) {
+      if (e?.name !== 'AbortError') window.alert(`공유 실패\n${e?.message ?? e}`);
+    }
+    return;
+  }
+
+  // iOS: 사진(url) + 글(message)을 한 번에
+  if (Platform.OS === 'ios') {
+    await Share.share({ url: uri, message: text, title: title || '사진' });
+    return;
+  }
+
+  // Android: 글은 클립보드로, 사진은 파일로 공유
+  if (text) await Clipboard.setStringAsync(text);
+  if (!(await Sharing.isAvailableAsync())) {
+    // 사진 공유가 안 되는 환경이면 글만이라도 공유
+    await Share.share({ message: text, title: title || '사진' });
+    return;
+  }
+  await Sharing.shareAsync(uri, {
+    mimeType: mimeFromUri(uri),
+    dialogTitle: title || '사진 공유',
+  });
+}
+
+/* ─────────────────────────────
  * 수정 모듈
  * navigation.navigate('PhotoEdit', { id: item.id }) 로 열기
  * ───────────────────────────── */
@@ -91,6 +158,7 @@ export default function PhotoEditScreen({ route, navigation }) {
   const [description, setDescription] = useState(item?.description ?? '');
   const [loading, setLoading] = useState(false);
   const [note, setNote] = useState(null); // { text, warn }
+  const [sharing, setSharing] = useState(false); // 공유 창 여는 중
   // 주소 조회 중 다른 요청이 시작되면 이전 결과를 버리기 위한 번호
   const reqId = useRef(0);
   // 저장 후 화면을 닫을 때는 "변경 취소" 확인을 띄우지 않음
@@ -276,6 +344,37 @@ export default function PhotoEditScreen({ route, navigation }) {
     navigation.goBack();
   };
 
+  // 공유: 지금 화면의 사진·제목·설명 (저장 전이라도 보이는 그대로)
+  const share = async () => {
+    if (sharing) return;
+    if (!uri) return Alert.alert('알림', '공유할 사진이 없어요.');
+    const t = title.trim();
+    const d = description.trim();
+    const go = async () => {
+      setSharing(true);
+      try {
+        await sharePhoto({ uri, title: t, description: d });
+      } catch (e) {
+        Alert.alert('공유 실패', e?.message ?? String(e));
+      } finally {
+        setSharing(false);
+      }
+    };
+    // Android는 사진과 글을 따로 보내야 하므로 먼저 안내
+    if (Platform.OS === 'android' && (t || d)) {
+      Alert.alert(
+        '사진 공유',
+        '제목과 설명을 복사해 둘게요.\n사진을 보낸 뒤 받는 앱(카카오톡 등)의 입력창에 붙여넣기 하세요.',
+        [
+          { text: '취소', style: 'cancel' },
+          { text: '공유하기', onPress: go },
+        ]
+      );
+      return;
+    }
+    go();
+  };
+
   const remove = () => {
     const doDelete = () => {
       saved.current = true;
@@ -371,6 +470,21 @@ export default function PhotoEditScreen({ route, navigation }) {
           <Text style={styles.primaryBtnText}>저장</Text>
         </TouchableOpacity>
 
+        {/* 공유: 사진 + 제목 + 설명 */}
+        <TouchableOpacity
+          style={[styles.shareBtn, sharing && styles.disabled]}
+          onPress={share}
+          disabled={sharing}>
+          {sharing ? (
+            <ActivityIndicator color="#2563eb" />
+          ) : (
+            <>
+              <Ionicons name="share-social-outline" size={16} color="#2563eb" />
+              <Text style={styles.shareText}>공유 (사진 + 제목 + 설명)</Text>
+            </>
+          )}
+        </TouchableOpacity>
+
         <TouchableOpacity style={styles.deleteBtn} onPress={remove}>
           <Ionicons name="trash-outline" size={16} color="#dc2626" />
           <Text style={styles.deleteText}>삭제</Text>
@@ -443,6 +557,19 @@ const styles = StyleSheet.create({
   },
   primaryBtnText: { color: '#fff', fontWeight: '700', fontSize: 16 },
   disabled: { opacity: 0.5 },
+  shareBtn: {
+    marginTop: 12,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 4,
+    paddingVertical: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#bfdbfe',
+    backgroundColor: '#fff',
+  },
+  shareText: { color: '#2563eb', fontWeight: '600' },
   deleteBtn: {
     marginTop: 12,
     flexDirection: 'row',
