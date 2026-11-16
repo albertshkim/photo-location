@@ -374,8 +374,74 @@ export function dongTitleFromAddress(address) {
   return tokens.find((t) => /^[가-힣]+(구|군|시)$/.test(t)) ?? null;
 }
 
+/* ─────────────────────────────
+ * 해외 주소 → 제목
+ *  1순위: 동네 단위 이름 (Quartier …, … District, 道玄坂 같은 丁目 앞 이름 등)
+ *  2순위: 처음 나오는 번지(숫자) 앞까지의 주소
+ *  예) "Eiffel Tower, 5, Avenue Anatole France, Quartier du Gros-Caillou, Paris, France" → Quartier du Gros-Caillou
+ *      "東京都渋谷区道玄坂２丁目２９−１"                       → 東京都渋谷区道玄坂
+ *      "미국 캘리포니아 마운틴뷰 앰피시어터 파크웨이 1600"       → 미국 캘리포니아 마운틴뷰 앰피시어터 파크웨이
+ *      "Rue de Rivoli 12, 75004 Paris, France"              → Rue de Rivoli
+ *      "1600 Amphitheatre Pkwy, Mountain View, CA 94043, USA" → Amphitheatre Pkwy, Mountain View, CA
+ * ───────────────────────────── */
+const KOREA_RE =
+  /(대한민국|South Korea|Republic of Korea)|(^|[\s,(])(서울|부산|대구|인천|광주|대전|울산|세종|경기|강원|충청|충북|충남|전라|전북|전남|경상|경북|경남|제주)|\b[A-Z][a-z]+-(dong|gu|eup|myeon)\b/i;
+const NEIGHBORHOOD_RE =
+  /\b(quartier|neighbou?rhood|district|ward|arrondissement|borough|barrio|bairro|colonia|kiez|ortsteil|stadtteil|quarter|sub-?district|kelurahan|barangay)\b|(丁目|町|街道|社区|社區|地区|地區|지구|구역)$/i;
+const DIGIT_RE = /[0-9０-９]/;
+const SEP_TRIM_RE = /^[\s,，、\-–−#№.:/]+|[\s,，、\-–−#№.:/]+$/g;
+
+const beforeFirstNumber = (s) => {
+  const i = s.search(DIGIT_RE);
+  return (i < 0 ? s : s.slice(0, i)).replace(/\b(No|Nr|n°)\.?\s*$/i, '').replace(SEP_TRIM_RE, '');
+};
+
+// 우편번호 덩어리 (75007, 150-0043, CA 94043, 〒150-0043) — 번지로 착각하지 않도록 먼저 뺌
+const POSTCODE_PART_RE = /^(〒\s*)?[A-Z]{0,3}\s?[0-9０-９][0-9０-９\-－−\s]{2,}[A-Z]{0,3}$/;
+
+// 제목이 너무 길지 않게 앞쪽 2덩어리까지만
+const firstParts = (s, n = 2) =>
+  s.split(/[,，、]/).map((p) => p.trim()).filter(Boolean).slice(0, n).join(', ');
+
+export function foreignTitleFromAddress(address) {
+  const raw = String(address).replace(/\s+/g, ' ').trim();
+  if (!raw) return null;
+  const parts = raw
+    .replace(/〒\s*[0-9０-９\-－−]+/g, ' ')
+    .split(/[,，、]/)
+    .map((p) => p.trim())
+    .filter((p) => p && !POSTCODE_PART_RE.test(p));
+  const text = parts.join(', ');
+
+  // 1) 동네 단위 이름 (숫자 없는 부분 중 작은 단위부터)
+  const hood = parts.find((p) => !DIGIT_RE.test(p) && NEIGHBORHOOD_RE.test(p));
+  if (hood) return hood;
+
+  // 2) 처음 번지(숫자) 앞까지
+  const head = firstParts(beforeFirstNumber(text));
+  if (head) return head;
+
+  // 3) 주소가 번지로 시작하면("1600 Amphitheatre Pkwy, …") 앞 번지를 빼고 다음 숫자 앞까지
+  const rest = firstParts(beforeFirstNumber(text.replace(/^[0-9０-９][^\s,，、]*[\s,，、]*/, '')));
+  return rest || null;
+}
+
+// 한국 주소 → "xx동", 해외 주소 → 동네 이름 또는 첫 번지 앞 주소
+export function titleFromAnyAddress(address) {
+  if (!address) return null;
+  if (KOREA_RE.test(address)) {
+    const t = dongTitleFromAddress(address);
+    if (t) return t;
+  }
+  return (
+    foreignTitleFromAddress(address) ||
+    // 그래도 못 만들면 주소 앞부분 (주소가 있으니 "주소정보 없음"은 쓰지 않음)
+    String(address).replace(/\s+/g, ' ').trim().slice(0, 20)
+  );
+}
+
 const titleFor = (coords, address) =>
-  coords && address ? dongTitleFromAddress(address) || NO_ADDRESS_TITLE : NO_ADDRESS_TITLE;
+  coords && address ? titleFromAnyAddress(address) || NO_ADDRESS_TITLE : NO_ADDRESS_TITLE;
 
 // 같은 위치(약 10m)는 한 번만 조회 — 화면을 다시 열어도 유지
 const addrCache = new Map();
@@ -384,16 +450,19 @@ let lastLookupAt = 0;
 async function lookupAddress(c) {
   const key = `${c.latitude.toFixed(4)},${c.longitude.toFixed(4)}`;
   if (addrCache.has(key)) return addrCache.get(key);
-  const wait = lastLookupAt + GEOCODE_GAP_MS - Date.now();
-  if (wait > 0) await sleep(wait);
-  lastLookupAt = Date.now();
-  try {
-    const r = await resolveAddress(c); // App.js: { address, source, errors }
-    if (r?.address) {
-      addrCache.set(key, r.address);
-      return r.address;
-    }
-  } catch {}
+  // 한 장씩 등록과 같은 resolveAddress 사용. 연속 호출로 실패하면 잠깐 쉬고 1번 더 시도
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const wait = lastLookupAt + GEOCODE_GAP_MS * (attempt + 1) - Date.now();
+    if (wait > 0) await sleep(wait);
+    lastLookupAt = Date.now();
+    try {
+      const r = await resolveAddress(c); // App.js: { address, source, errors }
+      if (r?.address) {
+        addrCache.set(key, r.address);
+        return r.address;
+      }
+    } catch {}
+  }
   return null; // 실패는 캐시하지 않음 (다시 찾기 가능)
 }
 
