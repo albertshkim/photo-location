@@ -42,7 +42,7 @@ import {
 // 수정 화면
 import PhotoEditScreen from './PhotoEdit';
 // 프로젝트(동네·장소·주제별) 화면
-import { ProjectListScreen, ProjectCreateScreen } from './Projects';
+import { ProjectListScreen, ProjectCreateScreen, BulkUploadScreen } from './Projects';
 import { typeIcon, typeLabel } from './storage';
 // 키워드 검색 (목록·리스트보기·보기 화면 공용)
 import { SearchBar, NoResult } from './Search';
@@ -747,6 +747,15 @@ function PhotoInputScreen({ navigation }) {
           <Text style={styles.projectBannerLink}>변경</Text>
         </TouchableOpacity>
 
+        {/* 여러 장을 한 번에: 위치로 "xxx동" 제목 자동, 위치 없으면 "주소정보 없음" */}
+        <TouchableOpacity
+          style={styles.bulkLink}
+          onPress={() => navigation.navigate('ListTab', { screen: 'BulkUpload' })}>
+          <Ionicons name="albums-outline" size={16} color="#2563eb" />
+          <Text style={styles.secondaryText}>여러 장 한 번에 올리기</Text>
+          <Ionicons name="chevron-forward" size={14} color="#2563eb" />
+        </TouchableOpacity>
+
         <TouchableOpacity style={styles.picker} onPress={pickImage} activeOpacity={0.8}>
           {uri ? (
             <ExpoImage source={{ uri }} style={styles.preview} contentFit="cover" />
@@ -901,6 +910,11 @@ const ListStack = () => (
       name="ProjectCreate"
       component={ProjectCreateScreen}
       options={{ title: '새 프로젝트' }}
+    />
+    <Stack.Screen
+      name="BulkUpload"
+      component={BulkUploadScreen}
+      options={{ title: '사진 대량 업로드' }}
     />
   </Stack.Navigator>
 );
@@ -1060,6 +1074,20 @@ const styles = StyleSheet.create({
   },
   projectBannerText: { flex: 1, fontSize: 13, color: '#7c2d12', fontWeight: '600' },
   projectBannerLink: { fontSize: 13, color: 'tomato', fontWeight: '700' },
+  // 등록 화면의 "여러 장 한 번에 올리기" 버튼
+  bulkLink: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    alignSelf: 'flex-start',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    marginBottom: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#2563eb',
+    backgroundColor: '#fff',
+  },
   // 헤더 버튼
   headerRight: { flexDirection: 'row', alignItems: 'center', marginRight: 16, gap: 10 },
   listBtn: {
