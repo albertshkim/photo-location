@@ -1,16 +1,21 @@
 /* ─────────────────────────────
  * Photoshortview.js — 보기 (사진만 작게, 한 줄에 1~5장, 기본 3장)
  * ─────────────────────────────
- * - 상단 검색창: 제목·설명·위치에 검색어가 들어간 사진만 표시
- * - 상단 헤더: 프로젝트 이름 ─── [위치보기] ─── [ − 3장 + ]  (토글은 둘 사이 정가운데)
- *   [위치보기]: 위치(번지 제외)별로 묶어서
+ * - 상단 검색창: 제목·설명·위치 + 날짜로 검색 (Datesearch.js의 searchItems, Home과 공용)
+ *   예) 2026 / 2026.11 / 2026.11.13 / 2026년 11월 / "2026.11 역삼동"
+ *   날짜는 찍은 날짜, 없으면 저장된 날짜 기준
+ * - 상단 헤더: 프로젝트 이름 ─── [전체|지역|위치] ─── [ − 3장 + ]  (보기 선택은 둘 사이 정가운데)
+ *   [전체]: 사진만 격자로
+ *   [지역]: 주소에서 나라 다음의 도시별로 묶어서
+ *     🏙 이스탄불 (12)      🏙 강릉시 (5)
+ *     (한국 주소는 도를 건너뛰고 시·군 기준: "강원특별자치도 강릉시 …" → 강릉시)
+ *   [위치]: 위치(번지 제외)별로 묶어서
  *     📍 서울특별시 강남구 역삼동 (3)
  *     [사진][사진][사진]
- *   처럼 보여줌. 다시 누르면 [전체보기]
  * - 하단 가운데 [최신순 ⇄ 오래된순] 토글 (찍은 날짜, 없으면 저장된 날짜 기준)
  * - 사진을 누르면 슬라이드 쇼 (SlideShow.js, Home과 공용)
  *   좌우로 밀어서 넘기기 · 반투명 [수정] [확대] 버튼
- *   지금 화면에 보이는 순서대로 넘어감 (위치보기면 위치 묶음 순서)
+ *   지금 화면에 보이는 순서대로 넘어감 (지역·위치보기면 묶음 순서)
  * - 상단 제목 옆 [ − 3장 + ] 으로 한 줄에 보여줄 사진 수 조정
  *   → 마지막으로 고른 장수를 저장해 두고, 앱을 다시 실행해도 그대로 사용
  */
@@ -22,8 +27,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { usePhotos } from './App';
-import { filterItems, SearchBar, NoResult } from './Search';
-import { sortByDate } from './Datesearch'; // 날짜순 정렬 (Home.js와 같은 기준)
+import { SearchBar, NoResult } from './Search';
+import { sortByDate, searchItems } from './Datesearch'; // 날짜순 정렬 + 날짜 포함 검색 (Home.js와 같은 기준)
 import SlideShow from './Slideshow'; // 사진 슬라이드 쇼 (Home.js와 공용)
 
 // 한 줄에 보여줄 사진 수: 1~5장, 처음 실행 시 3장 (이후에는 마지막으로 고른 장수)
@@ -92,12 +97,100 @@ export function locationGroup(location) {
   return name || NO_LOCATION;
 }
 
-// 정렬된 사진 → 위치별 묶음 [{ title, data: [...] }]
+// 나라 이름 (주소 맨 앞/맨 뒤에 붙는 경우 제거)
+const COUNTRIES = [
+  '대한민국', '한국', 'South Korea', 'Republic of Korea', 'Korea',
+  '튀르키예', '터키', 'Türkiye', 'Turkey', '일본', 'Japan', '日本', '중국', 'China', '中国',
+  '미국', '미합중국', 'United States of America', 'United States', 'USA', '대만', 'Taiwan',
+  '홍콩', 'Hong Kong', '베트남', 'Vietnam', 'Việt Nam', '태국', 'Thailand', '필리핀', 'Philippines',
+  '싱가포르', 'Singapore', '말레이시아', 'Malaysia', '인도네시아', 'Indonesia', '인도', 'India',
+  '몽골', 'Mongolia', '호주', 'Australia', '뉴질랜드', 'New Zealand', '캐나다', 'Canada',
+  '멕시코', 'Mexico', '영국', 'United Kingdom', 'UK', '프랑스', 'France', '독일', 'Germany',
+  'Deutschland', '이탈리아', 'Italy', 'Italia', '스페인', 'Spain', 'España', '포르투갈', 'Portugal',
+  '네덜란드', 'Netherlands', '스위스', 'Switzerland', '오스트리아', 'Austria', '체코', 'Czechia',
+  '헝가리', 'Hungary', '그리스', 'Greece', '러시아', 'Russia', '이집트', 'Egypt',
+  '아랍에미리트', 'United Arab Emirates', 'UAE',
+].sort((a, b) => b.length - a.length); // 긴 이름부터 비교 (United States of America → United States)
+const KOREA = new Set(['대한민국', '한국', 'South Korea', 'Republic of Korea', 'Korea']);
+const isCountry = (t) => COUNTRIES.some((c) => c.toLowerCase() === t.toLowerCase());
+
+// 한국 주소의 도(道) → 건너뛰고 그 다음 시·군을 지역으로 사용
+const KR_PROVINCE_SHORT = ['경기', '강원', '충북', '충남', '전북', '전남', '경북', '경남', '제주'];
+const isKrProvince = (t) => (/도$/.test(t) && /[가-힣]/.test(t)) || KR_PROVINCE_SHORT.includes(t);
+// 줄임말 → 정식 이름 (같은 도시가 두 묶음으로 나뉘지 않게)
+const KR_CITY_FULL = {
+  서울: '서울특별시', 서울시: '서울특별시', 부산: '부산광역시', 부산시: '부산광역시',
+  대구: '대구광역시', 대구시: '대구광역시', 인천: '인천광역시', 인천시: '인천광역시',
+  광주: '광주광역시', 대전: '대전광역시', 대전시: '대전광역시', 울산: '울산광역시', 울산시: '울산광역시',
+  세종: '세종특별자치시', 세종시: '세종특별자치시',
+};
+// 도시보다 큰 권역 이름 (OpenStreetMap 주소에 끼어 있음, 예: "마르마라 지역", "Marmara Bölgesi")
+const isAreaPart = (t) => /(지역|지방|Bölgesi|Region|Province|Prefecture)$/i.test(t);
+
+/* ─────────────────────────────
+ * 위치 → 지역(도시) 이름: 주소에서 나라 다음의 도시
+ * 예) "튀르키예 이스탄불 파티흐 …"                 → "이스탄불"
+ *     "대한민국 강릉시 무교동 12"                  → "강릉시"
+ *     "강원특별자치도 강릉시 교동 123"             → "강릉시"   (한국의 도는 건너뜀)
+ *     "서울특별시 강남구 역삼동 123-45"            → "서울특별시"
+ *     "152, 테헤란로, 역삼동, 강남구, 서울, 06236, 대한민국" → "서울특별시"
+ *     "Fatih, İstanbul, Marmara Bölgesi, 34000, Türkiye"   → "İstanbul"
+ *     좌표만 있거나 비어 있으면 → "위치 정보 없음"
+ * ───────────────────────────── */
+export function regionGroup(location) {
+  if (!location || !location.trim()) return NO_LOCATION;
+  const text = location.replace(/\([^)]*\)/g, ' ').replace(/📍/g, ' ').replace(/\s+/g, ' ').trim();
+  let country = null;
+  let parts;
+
+  if (text.includes(',')) {
+    // OpenStreetMap 형식: 작은 단위 → 큰 단위 → 뒤집어서 큰 단위부터
+    parts = text.split(',').map((t) => t.trim()).filter(Boolean).reverse();
+  } else {
+    // "나라 도시 구 …" 형식: 앞이나 뒤에 붙은 나라 이름 떼기 (두 단어 나라 이름도 처리)
+    let rest = text;
+    for (const c of COUNTRIES) {
+      const lc = c.toLowerCase();
+      if (rest.toLowerCase().startsWith(lc + ' ') || rest.toLowerCase() === lc) {
+        country = c;
+        rest = rest.slice(c.length).trim();
+        break;
+      }
+      if (rest.toLowerCase().endsWith(' ' + lc)) {
+        country = c;
+        rest = rest.slice(0, -c.length).trim();
+        break;
+      }
+    }
+    parts = rest.split(' ');
+  }
+
+  // 번지·우편번호·좌표·나라·권역 이름 제외
+  parts = parts.filter((t) => {
+    if (!t || isNumberPart(t) || isCoordPart(t) || /^\d{5,6}$/.test(t)) return false;
+    if (isCountry(t)) {
+      country = country ?? t;
+      return false;
+    }
+    return !isAreaPart(t);
+  });
+  if (!parts.length) return NO_LOCATION;
+
+  // 한국 주소(나라가 한국이거나 나라 이름이 없는 한글 주소): 도는 건너뛰고, 줄임말은 정식 이름으로
+  const korean = country ? KOREA.has(country) : /[가-힣]/.test(parts[0]);
+  if (korean) {
+    while (parts.length > 1 && isKrProvince(parts[0])) parts.shift();
+    return KR_CITY_FULL[parts[0]] ?? parts[0];
+  }
+  return parts[0];
+}
+
+// 정렬된 사진 → 묶음 [{ title, data: [...] }]  (keyOf: 사진 주소 → 묶음 이름)
 // 묶음 순서 = 정렬 순서에서 먼저 나온 묶음이 위 ("위치 정보 없음"은 맨 아래)
-function groupByLocation(list) {
+function groupBy(list, keyOf) {
   const map = new Map();
   list.forEach((it) => {
-    const key = locationGroup(it.location);
+    const key = keyOf(it.location);
     if (!map.has(key)) map.set(key, []);
     map.get(key).push(it);
   });
@@ -105,12 +198,19 @@ function groupByLocation(list) {
   return groups.sort((a, b) => (a.title === NO_LOCATION) - (b.title === NO_LOCATION));
 }
 
+// 보기 방식: 전체 / 지역(도시) / 위치(번지 제외)
+const VIEW_MODES = [
+  { key: 'all', label: '전체' },
+  { key: 'region', label: '지역' },
+  { key: 'location', label: '위치' },
+];
+
 /* ─────────────────────────────
  * 상단 헤더 (직접 만듦)
- * [프로젝트 이름 ▼] ──── [위치보기/전체보기] ──── [ − 3장 + ]
- * 토글은 왼쪽 제목과 오른쪽 장수 버튼 사이 공간의 정가운데에 위치
+ * [프로젝트 이름 ▼] ──── [전체|지역|위치] ──── [ − 3장 + ]
+ * 보기 선택은 왼쪽 제목과 오른쪽 장수 버튼 사이 공간의 정가운데에 위치
  * ───────────────────────────── */
-function ShortViewHeader({ projectName, onProjectPress, byLocation, onToggle, columns, onColumns }) {
+function ShortViewHeader({ projectName, onProjectPress, viewMode, onViewMode, columns, onColumns }) {
   const insets = useSafeAreaInsets();
   return (
     <View style={[styles.header, { paddingTop: insets.top }]}>
@@ -121,21 +221,22 @@ function ShortViewHeader({ projectName, onProjectPress, byLocation, onToggle, co
           <Ionicons name="chevron-down" size={16} color="#333" />
         </TouchableOpacity>
 
-        {/* 가운데: 위치보기 ⇄ 전체보기 토글 (글자 = 누르면 바뀔 보기) */}
+        {/* 가운데: 보기 선택 [전체|지역|위치] (선택된 칸이 색칠됨) */}
         <View style={styles.headerCenter}>
-          <TouchableOpacity
-            style={[styles.toggleBtn, byLocation && styles.toggleBtnOn]}
-            activeOpacity={0.7}
-            onPress={onToggle}>
-            <Ionicons
-              name={byLocation ? 'grid-outline' : 'location-outline'}
-              size={15}
-              color={byLocation ? '#fff' : 'tomato'}
-            />
-            <Text style={[styles.toggleText, byLocation && { color: '#fff' }]}>
-              {byLocation ? '전체보기' : '위치보기'}
-            </Text>
-          </TouchableOpacity>
+          <View style={styles.segment}>
+            {VIEW_MODES.map((m, i) => {
+              const on = viewMode === m.key;
+              return (
+                <TouchableOpacity
+                  key={m.key}
+                  style={[styles.segBtn, i > 0 && styles.segBtnBorder, on && styles.segBtnOn]}
+                  activeOpacity={0.7}
+                  onPress={() => onViewMode(m.key)}>
+                  <Text style={[styles.segText, on && styles.segTextOn]}>{m.label}</Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
         </View>
 
         {/* 오른쪽: 한 줄 사진 수 */}
@@ -149,16 +250,21 @@ export default function PhotoShortViewScreen({ navigation }) {
   const { items, currentProject } = usePhotos();
   const [query, setQuery] = useState('');
   const [order, setOrder] = useState('new'); // 'new' 최신순 | 'old' 오래된순
-  const [byLocation, setByLocation] = useState(false); // 위치보기
+  const [viewMode, setViewMode] = useState('all'); // 'all' 전체 | 'region' 지역(도시) | 'location' 위치
+  const grouped = viewMode !== 'all';
   const shown = useMemo(
-    () => sortByDate(filterItems(items, query), order),
+    () => sortByDate(searchItems(items, query), order), // 제목·설명·위치 + 날짜 검색
     [items, query, order]
   );
-  const groups = useMemo(() => (byLocation ? groupByLocation(shown) : []), [byLocation, shown]);
+  const groups = useMemo(() => {
+    if (viewMode === 'region') return groupBy(shown, regionGroup);
+    if (viewMode === 'location') return groupBy(shown, locationGroup);
+    return [];
+  }, [viewMode, shown]);
   // 슬라이드 쇼 순서 = 지금 화면에 보이는 순서
   const slideItems = useMemo(
-    () => (byLocation ? groups.flatMap((g) => g.data) : shown),
-    [byLocation, groups, shown]
+    () => (grouped ? groups.flatMap((g) => g.data) : shown),
+    [grouped, groups, shown]
   );
   const slidePos = useMemo(() => {
     const m = {};
@@ -169,7 +275,7 @@ export default function PhotoShortViewScreen({ navigation }) {
   const { width } = useWindowDimensions();
   const [columns, setColumns] = useSavedColumns();
 
-  // 상단 헤더: 프로젝트 이름 ─ [위치보기] ─ [ − 3장 + ]
+  // 상단 헤더: 프로젝트 이름 ─ [전체|지역|위치] ─ [ − 3장 + ]
   const projectName = currentProject?.name ?? '내 사진';
   useLayoutEffect(() => {
     navigation.setOptions({
@@ -177,15 +283,15 @@ export default function PhotoShortViewScreen({ navigation }) {
         <ShortViewHeader
           projectName={projectName}
           onProjectPress={() => navigation.navigate('ListTab', { screen: 'ProjectList' })}
-          byLocation={byLocation}
-          onToggle={() => setByLocation((v) => !v)}
+          viewMode={viewMode}
+          onViewMode={setViewMode}
           columns={columns}
           onColumns={setColumns}
         />
       ),
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [navigation, columns, byLocation, projectName]);
+  }, [navigation, columns, viewMode, projectName]);
 
   // 화면 폭에 맞춰 사진 크기 계산 (가로 회전·웹에서도 선택한 장수 유지)
   const size = Math.floor((width - PAD * 2 - GAP * (columns - 1)) / columns);
@@ -229,10 +335,10 @@ export default function PhotoShortViewScreen({ navigation }) {
         <SearchBar value={query} onChange={setQuery} total={items.length} shown={shown.length} />
       )}
 
-      {byLocation ? (
-        /* 위치보기: 📍 위치(번지 제외) + 그 위치의 사진들 */
+      {grouped ? (
+        /* 지역보기: 🏙 도시 + 그 도시의 사진들 / 위치보기: 📍 위치(번지 제외) + 그 위치의 사진들 */
         <FlatList
-          key={`loc-${columns}`}
+          key={`${viewMode}-${columns}`}
           data={groups}
           keyExtractor={(g) => g.title}
           keyboardShouldPersistTaps="handled"
@@ -243,7 +349,13 @@ export default function PhotoShortViewScreen({ navigation }) {
             <View style={styles.group}>
               <View style={styles.groupHeader}>
                 <Ionicons
-                  name={group.title === NO_LOCATION ? 'help-circle-outline' : 'location'}
+                  name={
+                    group.title === NO_LOCATION
+                      ? 'help-circle-outline'
+                      : viewMode === 'region'
+                        ? 'business'
+                        : 'location'
+                  }
                   size={15}
                   color="tomato"
                 />
@@ -335,7 +447,7 @@ const styles = StyleSheet.create({
     borderBottomColor: '#d1d5db',
   },
   headerRow: { height: 56, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16 },
-  headerTitleBtn: { flexDirection: 'row', alignItems: 'center', gap: 2, maxWidth: 120 },
+  headerTitleBtn: { flexDirection: 'row', alignItems: 'center', gap: 2, maxWidth: 110 },
   headerTitleText: { fontSize: 17, fontWeight: '600', color: '#111', flexShrink: 1 },
   headerCenter: { flex: 1, alignItems: 'center', paddingHorizontal: 8 },
   colBtn: {
@@ -350,20 +462,20 @@ const styles = StyleSheet.create({
   colBtnOff: { borderColor: '#ddd' },
   colText: { minWidth: 30, textAlign: 'center', fontSize: 14, fontWeight: '700', color: '#333' },
   thumb: { width: '100%', height: '100%', borderRadius: 6, backgroundColor: '#e5e7eb' },
-  // 헤더 가운데 위치보기 토글
-  toggleBtn: {
+  // 헤더 가운데 보기 선택 [전체|지역|위치]
+  segment: {
     flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    paddingHorizontal: 14,
-    paddingVertical: 6,
     borderRadius: 16,
     borderWidth: 1,
     borderColor: 'tomato',
+    overflow: 'hidden',
     backgroundColor: '#fff',
   },
-  toggleBtnOn: { backgroundColor: 'tomato' },
-  toggleText: { color: 'tomato', fontSize: 13, fontWeight: '700' },
+  segBtn: { paddingHorizontal: 9, paddingVertical: 6 },
+  segBtnBorder: { borderLeftWidth: 1, borderLeftColor: 'tomato' },
+  segBtnOn: { backgroundColor: 'tomato' },
+  segText: { color: 'tomato', fontSize: 12, fontWeight: '700' },
+  segTextOn: { color: '#fff' },
   // 위치별 묶음
   group: { marginBottom: 14 },
   groupHeader: {
