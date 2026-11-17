@@ -4,7 +4,8 @@
  * - 상단 검색창: 제목·설명·위치 + 날짜로 검색 (Datesearch.js의 searchItems, Home과 공용)
  *   예) 2026 / 2026.11 / 2026.11.13 / 2026년 11월 / "2026.11 역삼동"
  *   날짜는 찍은 날짜, 없으면 저장된 날짜 기준
- * - 상단 헤더: 프로젝트 이름 ─── [전체|지역|위치] ─── [ − 3장 + ]  (보기 선택은 둘 사이 정가운데)
+ * - 상단 헤더: 프로젝트 이름 ─── [보기 토글] ─── [ − 3장 + ]  (토글은 둘 사이 정가운데)
+ *   토글을 누를 때마다 전체 → 지역 → 위치 → 전체 … 순서로 바뀜 (처음에는 전체)
  *   [전체]: 사진만 격자로
  *   [지역]: 주소에서 나라 다음의 도시별로 묶어서
  *     🏙 이스탄불 (12)      🏙 강릉시 (5)
@@ -198,20 +199,25 @@ function groupBy(list, keyOf) {
   return groups.sort((a, b) => (a.title === NO_LOCATION) - (b.title === NO_LOCATION));
 }
 
-// 보기 방식: 전체 / 지역(도시) / 위치(번지 제외)
+// 보기 방식: 전체 → 지역(도시) → 위치(번지 제외) → 전체 … 순서로 돌아감
 const VIEW_MODES = [
-  { key: 'all', label: '전체' },
-  { key: 'region', label: '지역' },
-  { key: 'location', label: '위치' },
+  { key: 'all', label: '전체', icon: 'grid-outline' },
+  { key: 'region', label: '지역', icon: 'business-outline' },
+  { key: 'location', label: '위치', icon: 'location-outline' },
 ];
+const nextViewMode = (key) => {
+  const i = VIEW_MODES.findIndex((m) => m.key === key);
+  return VIEW_MODES[(i + 1) % VIEW_MODES.length].key;
+};
 
 /* ─────────────────────────────
  * 상단 헤더 (직접 만듦)
- * [프로젝트 이름 ▼] ──── [전체|지역|위치] ──── [ − 3장 + ]
- * 보기 선택은 왼쪽 제목과 오른쪽 장수 버튼 사이 공간의 정가운데에 위치
+ * [프로젝트 이름 ▼] ──── [보기 토글] ──── [ − 3장 + ]
+ * 토글은 왼쪽 제목과 오른쪽 장수 버튼 사이 공간의 정가운데에 위치
  * ───────────────────────────── */
 function ShortViewHeader({ projectName, onProjectPress, viewMode, onViewMode, columns, onColumns }) {
   const insets = useSafeAreaInsets();
+  const mode = VIEW_MODES.find((m) => m.key === viewMode) ?? VIEW_MODES[0];
   return (
     <View style={[styles.header, { paddingTop: insets.top }]}>
       <View style={styles.headerRow}>
@@ -221,22 +227,28 @@ function ShortViewHeader({ projectName, onProjectPress, viewMode, onViewMode, co
           <Ionicons name="chevron-down" size={16} color="#333" />
         </TouchableOpacity>
 
-        {/* 가운데: 보기 선택 [전체|지역|위치] (선택된 칸이 색칠됨) */}
+        {/* 가운데: 보기 토글 (글자 = 지금 보기, 누를 때마다 전체 → 지역 → 위치 → 전체)
+            아래 점 3개 = 지금이 몇 번째 보기인지 표시 */}
         <View style={styles.headerCenter}>
-          <View style={styles.segment}>
-            {VIEW_MODES.map((m, i) => {
-              const on = viewMode === m.key;
-              return (
-                <TouchableOpacity
+          <TouchableOpacity
+            style={[styles.toggleBtn, viewMode !== 'all' && styles.toggleBtnOn]}
+            activeOpacity={0.7}
+            onPress={() => onViewMode(nextViewMode(viewMode))}>
+            <Ionicons name={mode.icon} size={15} color={viewMode !== 'all' ? '#fff' : 'tomato'} />
+            <Text style={[styles.toggleText, viewMode !== 'all' && styles.toggleTextOn]}>{mode.label}</Text>
+            <View style={styles.dots}>
+              {VIEW_MODES.map((m) => (
+                <View
                   key={m.key}
-                  style={[styles.segBtn, i > 0 && styles.segBtnBorder, on && styles.segBtnOn]}
-                  activeOpacity={0.7}
-                  onPress={() => onViewMode(m.key)}>
-                  <Text style={[styles.segText, on && styles.segTextOn]}>{m.label}</Text>
-                </TouchableOpacity>
-              );
-            })}
-          </View>
+                  style={[
+                    styles.dot,
+                    viewMode !== 'all' && styles.dotOnDark,
+                    m.key === viewMode && (viewMode !== 'all' ? styles.dotActiveDark : styles.dotActive),
+                  ]}
+                />
+              ))}
+            </View>
+          </TouchableOpacity>
         </View>
 
         {/* 오른쪽: 한 줄 사진 수 */}
@@ -462,20 +474,27 @@ const styles = StyleSheet.create({
   colBtnOff: { borderColor: '#ddd' },
   colText: { minWidth: 30, textAlign: 'center', fontSize: 14, fontWeight: '700', color: '#333' },
   thumb: { width: '100%', height: '100%', borderRadius: 6, backgroundColor: '#e5e7eb' },
-  // 헤더 가운데 보기 선택 [전체|지역|위치]
-  segment: {
+  // 헤더 가운데 보기 토글 (전체 → 지역 → 위치)
+  toggleBtn: {
     flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
     borderRadius: 16,
     borderWidth: 1,
     borderColor: 'tomato',
-    overflow: 'hidden',
     backgroundColor: '#fff',
   },
-  segBtn: { paddingHorizontal: 9, paddingVertical: 6 },
-  segBtnBorder: { borderLeftWidth: 1, borderLeftColor: 'tomato' },
-  segBtnOn: { backgroundColor: 'tomato' },
-  segText: { color: 'tomato', fontSize: 12, fontWeight: '700' },
-  segTextOn: { color: '#fff' },
+  toggleBtnOn: { backgroundColor: 'tomato' }, // 지역·위치일 때 색칠
+  toggleText: { color: 'tomato', fontSize: 13, fontWeight: '700' },
+  toggleTextOn: { color: '#fff' },
+  // 몇 번째 보기인지 표시하는 점 3개
+  dots: { flexDirection: 'row', gap: 3, marginLeft: 3 },
+  dot: { width: 5, height: 5, borderRadius: 2.5, backgroundColor: '#fcc5b8' },
+  dotActive: { backgroundColor: 'tomato' },
+  dotOnDark: { backgroundColor: 'rgba(255,255,255,0.45)' },
+  dotActiveDark: { backgroundColor: '#fff' },
   // 위치별 묶음
   group: { marginBottom: 14 },
   groupHeader: {
