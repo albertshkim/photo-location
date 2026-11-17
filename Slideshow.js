@@ -9,6 +9,7 @@
  *     · 두 손가락으로 벌리기/오므리기, 한 손가락으로 끌어서 이동, 두 번 탭하면 1배 ↔ 2.5배
  *     · 아래 [ − 2.0배 + ] 로 배율 조절, [✕ 확대 끝]으로 다시 좌우 넘기기
  * - 확대 모드가 아닐 때는 사진에 터치 처리를 붙이지 않아서 좌우 넘기기가 그대로 동작함
+ * - 화면을 가로/세로로 돌려도 보고 있던 사진이 그대로 유지됨 (확대 배율도 유지)
  * (추가 라이브러리 없이 react-native의 PanResponder만 사용)
  */
 import React, { useEffect, useRef, useState } from 'react';
@@ -163,9 +164,26 @@ function ZoomableImage({ uri, width, height, recyclingKey, active, zoomCmd, onSc
  * 슬라이드 쇼 (모달 이미지)
  * ───────────────────────────── */
 export default function SlideShow({ visible, items, startIndex, onClose, onEdit }) {
-  const { width, height } = useWindowDimensions();
+  // 사진 한 장의 크기 = 슬라이드 화면의 실제 크기 (onLayout으로 측정)
+  // ※ Android는 가로일 때 내비게이션 바 때문에 창 크기(useWindowDimensions)와
+  //   실제 화면 크기가 다를 수 있음 → 넘길수록 위치가 어긋나는 원인이 되므로 실측값 사용
+  const win = useWindowDimensions();
+  const [box, setBox] = useState(null);
+  const width = box?.width ?? win.width;
+  const height = box?.height ?? win.height;
+  const onBoxLayout = (e) => {
+    const { width: w, height: h } = e.nativeEvent.layout;
+    setBox((b) => (b && b.width === w && b.height === h ? b : { width: w, height: h }));
+  };
+
   const listRef = useRef(null);
   const [index, setIndex] = useState(startIndex);
+  // 지금 보고 있는 사진 번호 (화면 회전 후 이 번호의 사진으로 다시 시작)
+  const indexRef = useRef(startIndex);
+  const setCurrent = (i) => {
+    indexRef.current = i;
+    setIndex(i);
+  };
   const [zoomed, setZoomed] = useState(false); // 확대 모드 (이때는 좌우 넘기기 멈춤)
   const [zoomScale, setZoomScale] = useState(1); // 지금 배율 (표시용)
   const [zoomCmd, setZoomCmd] = useState({ scale: START_SCALE, n: 0 });
@@ -173,11 +191,24 @@ export default function SlideShow({ visible, items, startIndex, onClose, onEdit 
   // 모달을 열 때마다 누른 사진부터, 확대 모드는 꺼진 상태로 시작
   useEffect(() => {
     if (visible) {
-      setIndex(startIndex);
+      setCurrent(startIndex);
       setZoomed(false);
       setZoomScale(1);
+    } else {
+      setBox(null); // 닫혀 있는 동안 회전했을 수 있으므로 다음에 열 때 다시 측정
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, startIndex]);
+
+  // 화면 회전: 목록은 보던 사진(indexRef)에서 다시 그려지고,
+  // 확대 중이었다면 같은 배율로 다시 확대 (위치는 가운데로)
+  const prevWidth = useRef(width);
+  useEffect(() => {
+    if (prevWidth.current === width) return;
+    prevWidth.current = width;
+    if (zoomed) setZoomCmd((c) => ({ scale: zoomScale, n: c.n + 1 }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [width]);
 
   const startZoom = () => {
     setZoomed(true);
@@ -198,14 +229,28 @@ export default function SlideShow({ visible, items, startIndex, onClose, onEdit 
   const goTo = (i) => {
     if (i < 0 || i >= items.length || zoomed) return;
     listRef.current?.scrollToIndex({ index: i, animated: true });
-    setIndex(i);
+    setCurrent(i);
   };
 
-  // 스크롤 위치로 지금 보이는 사진 번호 계산
-  const onScroll = (e) => {
-    const i = Math.round(e.nativeEvent.contentOffset.x / width);
-    if (i !== index && i >= 0 && i < items.length) setIndex(i);
+  // 스크롤 위치 → 지금 보이는 사진 번호
+  // 이벤트에 담긴 화면 폭(layoutMeasurement)으로 나눠서 계산
+  const indexFromEvent = (e) => {
+    const { contentOffset, layoutMeasurement } = e.nativeEvent;
+    const w = layoutMeasurement?.width || width;
+    return Math.round(contentOffset.x / w);
   };
+  const updateIndex = (e) => {
+    const i = indexFromEvent(e);
+    if (i >= 0 && i < items.length && i !== indexRef.current) setCurrent(i);
+  };
+  // 앱: 넘기기가 완전히 끝났을 때만 번호 갱신
+  //   (회전하는 순간에는 스크롤 위치가 예전 폭 기준으로 남아 있어서,
+  //    스크롤 중 계산하면 5번 → 2번처럼 엉뚱한 번호가 저장되던 문제 해결)
+  // 웹: 넘기기 끝 이벤트가 없으므로 스크롤 중에 계산
+  const scrollHandlers =
+    Platform.OS === 'web'
+      ? { onScroll: updateIndex, scrollEventThrottle: 16 }
+      : { onMomentumScrollEnd: updateIndex };
 
   const current = items[index];
 
@@ -217,10 +262,10 @@ export default function SlideShow({ visible, items, startIndex, onClose, onEdit 
       onRequestClose={zoomed ? endZoom : close} // Android 뒤로가기: 확대 중이면 확대만 끝냄
       supportedOrientations={['portrait', 'landscape']}>
       <StatusBar hidden={Platform.OS !== 'web'} />
-      <View style={styles.slideScreen}>
+      <View style={styles.slideScreen} onLayout={onBoxLayout}>
         {visible && items.length > 0 && (
           <FlatList
-            key={`slide-${width}`} // 화면 회전 시 폭이 바뀌면 다시 그림
+            key={`slide-${width}`} // 화면 회전 시 폭이 바뀌면 다시 그림 (보던 사진에서 시작)
             ref={listRef}
             data={items}
             extraData={`${zoomed}-${index}-${zoomCmd.n}`}
@@ -229,10 +274,10 @@ export default function SlideShow({ visible, items, startIndex, onClose, onEdit 
             pagingEnabled // 한 장씩 딱 맞게 넘어감
             scrollEnabled={!zoomed} // 확대 모드에서는 넘기지 않고 사진을 움직임
             showsHorizontalScrollIndicator={false}
-            initialScrollIndex={Math.min(startIndex, items.length - 1)}
+            // 처음 연 사진(startIndex)이 아니라 "지금 보고 있던 사진"에서 시작
+            initialScrollIndex={Math.max(0, Math.min(indexRef.current, items.length - 1))}
             getItemLayout={(_, i) => ({ length: width, offset: width * i, index: i })}
-            onScroll={onScroll}
-            scrollEventThrottle={16}
+            {...scrollHandlers}
             initialNumToRender={3}
             windowSize={5}
             renderItem={({ item, index: i }) => (
