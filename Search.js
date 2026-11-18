@@ -33,7 +33,7 @@ export function SearchBar({ value, onChange, total, shown }) {
           style={styles.searchInput}
           value={value}
           onChangeText={onChange}
-          placeholder="날짜, 제목, 설명, 위치로 검색 (예: 2026.11, 영등)"
+          placeholder="날짜,제목,설명,위치로 검색(예:2026.11, 영등)"
           placeholderTextColor="#9ca3af"
           returnKeyType="search"
           autoCorrect={false}
