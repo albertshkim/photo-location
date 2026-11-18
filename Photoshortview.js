@@ -32,9 +32,9 @@ import { SearchBar, NoResult } from './Search';
 import { sortByDate, searchItems } from './Datesearch'; // 날짜순 정렬 + 날짜 포함 검색 (Home.js와 같은 기준)
 import SlideShow from './Slideshow'; // 사진 슬라이드 쇼 (Home.js와 공용)
 
-// 한 줄에 보여줄 사진 수: 1~5장, 처음 실행 시 3장 (이후에는 마지막으로 고른 장수)
+// 한 줄에 보여줄 사진 수: 1~7장, 처음 실행 시 3장 (이후에는 마지막으로 고른 장수)
 const MIN_COLUMNS = 1;
-const MAX_COLUMNS = 5;
+const MAX_COLUMNS = 7;
 const DEFAULT_COLUMNS = 3;
 const COLUMNS_KEY = 'photoshortview.columns'; // 저장 키
 const GAP = 4; // 사진 사이 간격
