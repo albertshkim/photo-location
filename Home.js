@@ -53,6 +53,8 @@ export { photoDate, formatDate, searchItems };
 import PhotoShortViewScreen from './Photoshortview';
 // 사진 슬라이드 쇼 (보기 화면과 공용)
 import SlideShow from './Slideshow';
+// 사진찍기 화면 (직접 찍어서 바로 등록)
+import PhotoDirectScreen from './Photodirect';
 
 /* ─────────────────────────────
  * 리스트 모듈
@@ -966,7 +968,23 @@ const ViewStack = () => (
   </Stack.Navigator>
 );
 
-const TAB_ICONS = { ListTab: 'list', ViewTab: 'grid-outline', InputTab: 'add-circle-outline' };
+// 사진찍기 탭: 카메라로 바로 찍고 위치·주소·제목 자동 입력 후 등록 (Photodirect.js)
+const CameraStack = () => (
+  <Stack.Navigator>
+    <Stack.Screen
+      name="PhotoDirect"
+      component={PhotoDirectScreen}
+      options={{ title: '사진찍기' }}
+    />
+  </Stack.Navigator>
+);
+
+const TAB_ICONS = {
+  ListTab: 'list',
+  ViewTab: 'grid-outline',
+  CameraTab: 'camera-outline',
+  InputTab: 'add-circle-outline',
+};
 
 // App.js가 실행되면 이 화면(Home)이 열립니다
 export default function Home() {
@@ -983,6 +1001,7 @@ export default function Home() {
         })}>
         <Tab.Screen name="ListTab" component={ListStack} options={{ title: '목록' }} />
         <Tab.Screen name="ViewTab" component={ViewStack} options={{ title: '보기' }} />
+        <Tab.Screen name="CameraTab" component={CameraStack} options={{ title: '사진찍기' }} />
         <Tab.Screen name="InputTab" component={InputStack} options={{ title: '등록' }} />
       </Tab.Navigator>
     </NavigationContainer>
