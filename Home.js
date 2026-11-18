@@ -119,7 +119,33 @@ function createShared(initial) {
     return [v, set];
   };
 }
-const useSortOrder = createShared('new'); // 'new' 최신순 | 'old' 오래된순 (찍은 날짜, 없으면 저장 날짜)
+// 'new' 최신순 | 'old' 오래된순 (찍은 날짜, 없으면 저장 날짜) | 'record' 기록순 (앱에 등록한 순서)
+const useSortOrder = createShared('new');
+
+/* ─────────────────────────────
+ * 정렬 버튼: 누를 때마다 최신순 → 오래된순 → 기록순 → 최신순 …
+ * ───────────────────────────── */
+const SORT_STEPS = ['new', 'old', 'record'];
+const SORT_INFO = {
+  new: { label: '최신순', icon: 'arrow-down' },
+  old: { label: '오래된순', icon: 'arrow-up' },
+  record: { label: '기록순', icon: 'create-outline' },
+};
+const nextSort = (cur) => SORT_STEPS[(SORT_STEPS.indexOf(cur) + 1) % SORT_STEPS.length];
+
+// 기록순: 등록한 시각(createdAt)이 늦은 것부터 = 가장 최근에 기록한 사진이 맨 위
+// 등록 시각이 없는 예전 데이터는 맨 뒤, 같으면 저장된 순서 유지
+function sortByRecord(list) {
+  return list
+    .map((it, i) => ({ it, i, t: Number.isFinite(it?.createdAt) ? it.createdAt : -Infinity }))
+    .sort((a, b) => (a.t === b.t ? a.i - b.i : b.t - a.t))
+    .map((x) => x.it);
+}
+
+// 목록 정렬 (최신순/오래된순은 촬영일 기준, 기록순은 등록 순서)
+function sortItems(list, order) {
+  return order === 'record' ? sortByRecord(list) : sortByDate(list, order);
+}
 const useViewMode = createShared('card'); // 'card' 카드보기 | 'list' 리스트보기
 
 /* ─────────────────────────────
@@ -164,17 +190,17 @@ function MainHeader({ navigation }) {
   );
 }
 
-// 화면 가운데 아래: 정렬 토글 (누를 때마다 최신순 ↔ 오래된순, 글자 = 지금 정렬)
+// 화면 가운데 아래: 정렬 토글 (누를 때마다 최신순 → 오래된순 → 기록순, 글자 = 지금 정렬)
 function SortToggle({ value, onChange }) {
-  const isNew = value === 'new';
+  const info = SORT_INFO[value] ?? SORT_INFO.new;
   return (
     <View style={styles.sortWrap} pointerEvents="box-none">
       <TouchableOpacity
         style={styles.sortToggle}
         activeOpacity={0.8}
-        onPress={() => onChange(isNew ? 'old' : 'new')}>
-        <Ionicons name={isNew ? 'arrow-down' : 'arrow-up'} size={14} color="#fff" />
-        <Text style={styles.sortToggleText}>{isNew ? '최신순' : '오래된순'}</Text>
+        onPress={() => onChange(nextSort(value))}>
+        <Ionicons name={info.icon} size={14} color="#fff" />
+        <Text style={styles.sortToggleText}>{info.label}</Text>
         <Ionicons name="swap-vertical" size={14} color="rgba(255,255,255,0.8)" />
       </TouchableOpacity>
     </View>
@@ -191,7 +217,7 @@ function PhotoHomeScreen({ navigation }) {
   const [order, setOrder] = useSortOrder();
   const [mode] = useViewMode();
   const shown = useMemo(
-    () => sortByDate(searchItems(items, query), order),
+    () => sortItems(searchItems(items, query), order),
     [items, query, order]
   );
   const searching = !!query.trim();
@@ -921,14 +947,17 @@ const ListStack = () => (
   </Stack.Navigator>
 );
 
-// 헤더 제목: 현재 프로젝트 이름 + ▼
+// 헤더 제목: 현재 프로젝트 이름(사진 수) + ▼   예) 내 사진(55)
+// 이름이 길면 이름만 "…"으로 줄이고 사진 수는 항상 보이게 함
 function ProjectHeaderTitle({ onPress }) {
-  const { currentProject } = usePhotos();
+  const { currentProject, items } = usePhotos();
+  const count = Array.isArray(items) ? items.length : 0; // 현재 프로젝트에 저장된 사진 수
   return (
     <TouchableOpacity style={styles.headerTitleBtn} onPress={onPress}>
       <Text style={styles.headerTitleText} numberOfLines={1}>
         {currentProject?.name ?? '내 사진'}
       </Text>
+      <Text style={styles.headerCountText}>({count})</Text>
       <Ionicons name="chevron-down" size={16} color="#333" />
     </TouchableOpacity>
   );
@@ -1079,8 +1108,9 @@ const styles = StyleSheet.create({
   },
   primaryBtnText: { color: '#fff', fontWeight: '700', fontSize: 16 },
   // 헤더 제목 (프로젝트 이름)
-  headerTitleBtn: { flexDirection: 'row', alignItems: 'center', gap: 2, maxWidth: 150 },
+  headerTitleBtn: { flexDirection: 'row', alignItems: 'center', gap: 2, maxWidth: 180 },
   headerTitleText: { fontSize: 17, fontWeight: '600', color: '#111', flexShrink: 1 },
+  headerCountText: { fontSize: 17, fontWeight: '600', color: 'tomato', flexShrink: 0 },
   // 등록 화면의 "저장할 프로젝트" 표시
   projectBanner: {
     flexDirection: 'row',
